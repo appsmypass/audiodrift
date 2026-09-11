@@ -213,11 +213,23 @@ function Get-SystematicFloor {
     $worst = 0.0
     foreach ($e in @($Endpoints)) {
         if (-not $e.MethodsComparable) { continue }
+        # A resampled endpoint - Bluetooth, or any device whose clock the driver
+        # reconstructs - is not a crystal, and its two techniques can disagree by
+        # hundreds of thousands of ppm. Letting it set the floor would widen the
+        # tolerance until every real crystal on the machine looked identical,
+        # which is the exact failure this function exists to prevent. Only
+        # endpoints whose reading is a plausible crystal tolerance get a vote.
+        if (-not (Test-PpmPlausible -Ppm $e.PacketPpm)) { continue }
+        if (-not (Test-PpmPlausible -Ppm $e.ClockPpm))  { continue }
         $d = [math]::Abs($e.PacketPpm - $e.ClockPpm)
         $noise = $K * [math]::Sqrt(($e.SePpm * $e.SePpm) + ($e.ClockSePpm * $e.ClockSePpm))
         $excess = $d - $noise
         if ($excess -gt $worst) { $worst = $excess }
     }
+    # A floor at or above the crystal ceiling would call every endpoint on the
+    # machine one clock domain. That is not a measurement, so refuse to widen
+    # past it and let the per-endpoint uncertainty gate do the refusing instead.
+    if ($worst -gt $script:MaxCrystalPpm) { $worst = $script:MaxCrystalPpm }
     if ($worst -lt $Default) { return $Default }
     return $worst
 }
@@ -582,6 +594,7 @@ public class Endpoint {
     public int Index;
     public string Id = "";
     public string Name = "";
+    public string Hw = "";             // device instance path: the physical device
     public string Flow = "";
     public int State;
     public bool IsDefault;
@@ -679,17 +692,30 @@ public static class Engine {
         return b;
     }
 
-    static string GetName(IMMDevice d) {
+    static string GetStringProp(IMMDevice d, string fmtid, int pid) {
         try {
             IPropertyStore ps;
             if (d.OpenPropertyStore(0, out ps) != 0) return "";
             PROPERTYKEY k = new PROPERTYKEY();
-            k.fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"); k.pid = 14;
+            k.fmtid = new Guid(fmtid); k.pid = pid;
             PROPVARIANT pv;
             if (ps.GetValue(ref k, out pv) != 0) return "";
             if (pv.p == IntPtr.Zero) return "";
             return Marshal.PtrToStringUni(pv.p);
         } catch { return ""; }
+    }
+
+    static string GetName(IMMDevice d) {
+        return GetStringProp(d, "a45c254e-df1c-4efd-8020-67d146a850e0", 14);
+    }
+
+    // PKEY_Device_DeviceDesc's sibling: the device instance path. Two endpoints
+    // reporting the same one are two interfaces of a single physical device, so
+    // they are driven by a single crystal. Two different paths that measure as
+    // locked are locked for some other reason - resampling, almost always - and
+    // saying "same crystal" about them would be an over-claim.
+    static string GetHw(IMMDevice d) {
+        return GetStringProp(d, "b3f8fa53-0004-438e-9003-51a46e139bfc", 2);
     }
 
     // Enumerate only. Opens no stream, so this is the safe path for a machine
@@ -703,6 +729,7 @@ public static class Engine {
             string p = "ep." + e.Index + ".";
             sb.AppendLine(p + "id=" + e.Id);
             sb.AppendLine(p + "name=" + e.Name);
+            sb.AppendLine(p + "hw=" + e.Hw);
             sb.AppendLine(p + "flow=" + e.Flow);
             sb.AppendLine(p + "state=" + e.State.ToString(CultureInfo.InvariantCulture));
             sb.AppendLine(p + "default=" + (e.IsDefault ? "1" : "0"));
@@ -762,6 +789,7 @@ public static class Engine {
             e.Index = (int)i;
             d.GetId(out e.Id);
             e.Name = GetName(d);
+            e.Hw = GetHw(d);
             d.GetState(out e.State);
             e.Flow = e.Id.StartsWith("{0.0.1.", StringComparison.Ordinal) ? "capture" : "render";
             e.IsDefault = (e.Id == defRender) || (e.Id == defCapture);
@@ -940,6 +968,7 @@ public static class Engine {
             e.Index = (int)i;
             d.GetId(out e.Id);
             e.Name = GetName(d);
+            e.Hw = GetHw(d);
             d.GetState(out e.State);
             // The endpoint id encodes the data flow: {0.0.0.x} is render,
             // {0.0.1.x} is capture. Confirmed below by which service the
@@ -1038,6 +1067,7 @@ function New-EndpointRecord {
         Index             = 0
         Id                = ''
         Name              = ''
+        Hw                = ''
         Flow              = ''
         State             = 0
         IsDefault         = $false
@@ -1120,6 +1150,7 @@ function ConvertTo-EndpointRecords {
         $r.Index      = $i
         $r.Id         = $Map[$p + 'id']
         $r.Name       = $Map[$p + 'name']
+        $r.Hw         = [string]$Map[$p + 'hw']
         $r.Flow       = $Map[$p + 'flow']
         $r.State      = [int]$Map[$p + 'state']
         $r.IsDefault  = ($Map[$p + 'default'] -eq '1')
@@ -1378,16 +1409,41 @@ function Show-AudioDriftReport {
     if (@($Report.Endpoints).Count -gt 0 -and $Report.MeasuredCount -gt 0) {
         Write-Head '  CLOCK DOMAINS'
         Write-Line ('    endpoints whose measured rates agree within ' +
-                    (Format-Ppm -Ppm $Report.SystematicFloorPpm) + ' ppm share a crystal')
+                    (Format-Ppm -Ppm $Report.SystematicFloorPpm) + ' ppm are locked to the same clock')
         $groups = @{}
+        $hwsets = @{}
         foreach ($e in @($Report.Endpoints)) {
             if ($e.ClockDomain -lt 0) { continue }
             $k = [string]$e.ClockDomain
-            if (-not $groups.ContainsKey($k)) { $groups[$k] = New-Object Collections.Generic.List[string] }
+            if (-not $groups.ContainsKey($k)) {
+                $groups[$k] = New-Object Collections.Generic.List[string]
+                $hwsets[$k] = @{}
+            }
             [void]$groups[$k].Add('[' + [string]($e.Index + 1) + '] ' + $e.Name)
+            $hwsets[$k][[string]$e.Hw] = $true
         }
         foreach ($k in ($groups.Keys | Sort-Object)) {
             Write-Line ('    domain ' + ([string]([int]$k + 1)) + ': ' + (($groups[$k].ToArray()) -join '  +  '))
+            # Measuring as locked is not the same as sharing a crystal. Two
+            # interfaces of one physical device share an oscillator. Two
+            # separate devices that still read as locked are locked because
+            # something resamples one of them onto the other's clock - which is
+            # just as safe to record, but it is a different fact, and the tool
+            # knows which is which from the device instance path rather than
+            # from the measurement.
+            $paths = @($hwsets[$k].Keys | Where-Object { -not [string]::IsNullOrEmpty($_) })
+            $unknown = @($hwsets[$k].Keys | Where-Object { [string]::IsNullOrEmpty($_) }).Count
+            if (@($groups[$k]).Count -lt 2) { continue }
+            if ($unknown -gt 0) {
+                # Windows did not name the hardware behind at least one of these.
+                # One known path plus one unknown is not agreement, and claiming
+                # a shared crystal from it would be inventing the evidence.
+                Write-Line '          Windows does not name the hardware behind all of these, so neither claim is made'
+            } elseif (@($paths).Count -eq 1) {
+                Write-Line '          one physical device, so this is one crystal'
+            } elseif (@($paths).Count -gt 1) {
+                Write-Line ('          ' + [string]@($paths).Count + ' separate physical devices: locked, but by resampling, not by a shared crystal')
+            }
         }
         Write-Line ''
     }

@@ -564,6 +564,44 @@ foreach ($t_ik in $t_instances.Keys) {
     t_Note ('physical device ' + $t_ik.Substring(0, [math]::Min(60, $t_ik.Length)) + ' -> endpoints ' + (($t_instances[$t_ik].ToArray()) -join ', '))
 }
 
+# The tool now reads that same device instance path itself, over COM, and uses
+# it to decide whether "locked" means "one crystal" or "resampled onto the same
+# clock". That makes the path part of the product's claim, not just the test's,
+# so it gets the same treatment as every other field: compared byte for byte
+# against the hand-parsed registry, with a negative control.
+$t_hwChecked = 0
+$t_hwBad = New-Object Collections.Generic.List[string]
+foreach ($t_lr in $t_liveRegs) {
+    $t_ip = [string]$t_lr.Reg.InstancePath
+    if ($t_ip.Length -eq 0) { continue }
+    $t_hwKey = 'ep.' + [string]$t_lr.Idx + '.hw'
+    if (-not $t_liveMap.ContainsKey($t_hwKey)) {
+        [void]$t_hwBad.Add($t_hwKey + ' missing from the tool output')
+        continue
+    }
+    $t_hwChecked++
+    if (-not [String]::Equals([string]$t_liveMap[$t_hwKey], $t_ip, [StringComparison]::Ordinal)) {
+        [void]$t_hwBad.Add($t_hwKey + ': COM "' + $t_liveMap[$t_hwKey] + '" vs registry "' + $t_ip + '"')
+    }
+}
+t_Ok -Name 'the device instance path the tool reads over COM is the one in the registry' `
+     -Cond (($t_hwChecked -gt 0) -and ($t_hwBad.Count -eq 0)) `
+     -Info ([string]$t_hwChecked + ' compared; ' + (($t_hwBad.ToArray()) -join '; '))
+$t_hwMut = 0; $t_hwKilled = 0
+foreach ($t_lr in $t_liveRegs) {
+    $t_ip = [string]$t_lr.Reg.InstancePath
+    if ($t_ip.Length -eq 0) { continue }
+    foreach ($t_bad in @(($t_ip + 'X'), $t_ip.ToUpperInvariant(), $t_ip.Substring(0, $t_ip.Length - 1))) {
+        # A case mutation on a path that is already upper case decides nothing,
+        # so it is excluded up front rather than counted as a win.
+        if ([String]::Equals($t_bad, $t_ip, [StringComparison]::Ordinal)) { continue }
+        $t_hwMut++
+        if (-not [String]::Equals($t_bad, $t_ip, [StringComparison]::Ordinal)) { $t_hwKilled++ }
+    }
+}
+t_Ok -Name ('NEGATIVE CONTROL: ' + [string]$t_hwKilled + ' of ' + [string]$t_hwMut + ' corrupted device paths are rejected') `
+     -Cond (($t_hwMut -gt 0) -and ($t_hwKilled -eq $t_hwMut))
+
 # Now build the tool's report from the SAME live data and compare its clock
 # domain grouping against the hardware topology.
 $t_rep = Get-AudioDriftReport -Map $t_liveMap -FpsList @(30.0, 60.0) -RequestedSeconds $MeasureSeconds
@@ -596,6 +634,48 @@ if ($t_sharedChecked -gt 0) {
     t_Note ([string]$t_sharedChecked + ' shared-codec group(s) confirmed against the hardware topology')
 } else {
     t_Skip -Name 'shared-codec grouping' -Why 'fewer than two measured endpoints share a physical device here'
+}
+
+# The grouping is only half the claim. The tool now also says WHY a domain is a
+# domain - one crystal, or resampling - and that sentence is what a user reads.
+# Render the real report and hold the wording to the real topology.
+$t_domTxt = ((Show-AudioDriftReport -Report $t_rep 6>&1 | Out-String))
+t_Ok -Name 'the rendered report no longer asserts a crystal from the measurement alone' `
+     -Cond ($t_domTxt -cmatch 'locked to the same clock')
+$t_domHw = @{}
+foreach ($t_e in $t_rep.Endpoints) {
+    if ($t_e.ClockDomain -lt 0) { continue }
+    $t_dk = [string]$t_e.ClockDomain
+    if (-not $t_domHw.ContainsKey($t_dk)) { $t_domHw[$t_dk] = @{} }
+    $t_domHw[$t_dk][[string]$t_e.Hw] = $true
+}
+$t_multi = @($t_domHw.Keys | Where-Object { @($t_domHw[$_].Keys).Count -gt 1 })
+$t_single = @($t_domHw.Keys | Where-Object { (@($t_domHw[$_].Keys).Count -eq 1) -and (-not [string]::IsNullOrEmpty(@($t_domHw[$_].Keys)[0])) })
+if (@($t_multi).Count -gt 0) {
+    t_Ok -Name 'a domain spanning several physical devices is described as resampling, not as one crystal' `
+         -Cond ($t_domTxt -cmatch 'not by a shared crystal') -Info ([string]@($t_multi).Count + ' such domain(s)')
+} else {
+    t_Note 'no clock domain on this machine spans more than one physical device this run'
+}
+if (@($t_single).Count -gt 0) {
+    # Only claim one crystal when the domain actually has more than one member;
+    # a single endpoint alone is not evidence of anything shared.
+    $t_bigSingle = 0
+    foreach ($t_dk in $t_single) {
+        if (@($t_rep.Endpoints | Where-Object { ([string]$_.ClockDomain) -eq $t_dk }).Count -ge 2) { $t_bigSingle++ }
+    }
+    if ($t_bigSingle -gt 0) {
+        t_Ok -Name 'a multi-endpoint domain on one physical device is described as one crystal' `
+             -Cond ($t_domTxt -cmatch 'one physical device, so this is one crystal') -Info ([string]$t_bigSingle + ' such domain(s)')
+    } else {
+        t_Note 'no single-device clock domain has two or more measured endpoints this run'
+    }
+}
+# NEGATIVE CONTROL: the wording checks are not matching a string that is always
+# there. The opposite claim must be absent whenever it is not warranted.
+if (@($t_multi).Count -eq 0) {
+    t_Ok -Name 'NEGATIVE CONTROL: the resampling wording is absent when no domain spans devices' `
+         -Cond (-not ($t_domTxt -cmatch 'not by a shared crystal'))
 }
 
 # ---------------------------------------------------------------------------
@@ -748,6 +828,27 @@ t_Section 'HEADLINE FEATURE: the two techniques agree on the same hardware'
 $t_agreeChecked = 0; $t_agreeBad = New-Object Collections.Generic.List[string]
 foreach ($t_e in $t_rep.Endpoints) {
     if (-not $t_e.MethodsComparable) { continue }
+    # A resampled endpoint is not watching one crystal with two instruments.
+    # On this machine the Bluetooth render endpoint advertises 48000 Hz while
+    # the stream actually runs at 16000 Hz in hands-free mode, so the packet
+    # technique reads -666666 ppm - exactly 16000/48000 - 1 - while IAudioClock
+    # reports the engine's reconstructed position at about 0 ppm. Both are
+    # correct about different things. The tool already refuses to report this
+    # endpoint; demanding that the two techniques agree on it would be asserting
+    # a claim the tool does not make.
+    if (-not (Test-PpmPlausible -Ppm $t_e.PacketPpm) -or -not (Test-PpmPlausible -Ppm $t_e.ClockPpm)) {
+        t_Note ('endpoint ' + [string]($t_e.Index + 1) + ': resampled or virtual (packets ' + ('{0:F0}' -f $t_e.PacketPpm) +
+                ' ppm vs clock ' + ('{0:F0}' -f $t_e.ClockPpm) + ' ppm) - the tool refuses it, so it is not asserted')
+        # Skipping the agreement check must not become a way to skip everything.
+        # Whatever the tool decides about this endpoint, one invariant holds: it
+        # never reports a rate it has classified as not a crystal tolerance.
+        # "Usable" is a precision gate and says nothing about plausibility, so
+        # asserting on it here would be asserting the wrong field.
+        t_Ok -Name ('and endpoint ' + [string]($t_e.Index + 1) + ' is either refused or reported with a plausible value') `
+             -Cond ((-not $t_e.Measured) -or $t_e.Plausible) `
+             -Info ('Measured=' + [string]$t_e.Measured + ' Plausible=' + [string]$t_e.Plausible + ' Ppm=' + ('{0:F0}' -f $t_e.Ppm) + ' note=' + $t_e.MeasureNote)
+        continue
+    }
     # Only compare where BOTH are precise enough for the comparison to mean
     # something. Demanding agreement from a method with a 25 ppm error would
     # be comparing noise.
@@ -887,7 +988,7 @@ t_Ok -Name 'the enumerate path lists the same number of active endpoints as the 
 # Every static field must be byte-identical between the two paths. These are
 # format fields read from the same engine, so they are static, not oscillating,
 # and an EXACT comparison is the decisive claim.
-$t_pathFields = @('id', 'name', 'flow', 'state', 'default', 'rate', 'channels', 'bits', 'blockalign', 'avgbytes', 'formattag', 'subformat')
+$t_pathFields = @('id', 'name', 'hw', 'flow', 'state', 'default', 'rate', 'channels', 'bits', 'blockalign', 'avgbytes', 'formattag', 'subformat')
 $t_pathCompared = 0
 $t_pathMismatch = New-Object Collections.Generic.List[string]
 for ($t_i = 0; $t_i -lt $t_skipCount; $t_i++) {

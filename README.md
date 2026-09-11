@@ -16,39 +16,62 @@ every endpoint and tells you which ones share a clock.
 ```
 audiodrift 1.0.0  -  the sample rate your hardware actually runs at
 
-  [1] Speakers (2- Realtek High Definition Audio(SST))
+  [1] Headphones (iClever-BTH12)
       render, default   nominal 48000 Hz, 2 ch, 32-bit IEEE float
-      measured 48000.1234 Hz   +2.572 ppm  +/- 0.048 ppm
-      that is 9.3 ms of drift per hour against the system clock
-      via packet timestamps, 5997 packets over 60.0 s
-      cross-check: IAudioClock polling gives 2.639 +/- 0.346 ppm, a difference of 0.067 ppm
-      uncertainty: regression 0.006 ppm, batch scatter 0.048 ppm; the larger is reported
+      ! reading of -666665 ppm is not a crystal tolerance (resampled or virtual endpoint)
 
-  [2] Microphone Array (2- Realtek High Definition Audio(SST))
+  [2] Speakers (2- Realtek High Definition Audio(SST))
+      render   nominal 48000 Hz, 2 ch, 32-bit IEEE float
+      measured 48000.1051 Hz   +2.189 ppm  +/- 0.191 ppm
+      that is 7.9 ms of drift per hour against the system clock
+      via packet timestamps, 5968 packets over 60.0 s
+      cross-check: IAudioClock polling gives 3.210 +/- 1.987 ppm, a difference of 1.021 ppm
+      uncertainty: regression 0.006 ppm, batch scatter 0.191 ppm; the larger is reported
+
+  [3] Microphone Array (2- Realtek High Definition Audio(SST))
       capture, default   nominal 48000 Hz, 2 ch, 32-bit IEEE float
-      measured 48000.1239 Hz   +2.581 ppm  +/- 0.049 ppm
-      that is 9.3 ms of drift per hour against the system clock
-      via packet timestamps, 5996 packets over 60.0 s
-      cross-check: IAudioClock polling gives 6.202 +/- 21.142 ppm, a difference of 3.622 ppm
-      uncertainty: regression 0.005 ppm, batch scatter 0.049 ppm; the larger is reported
+      measured 48000.1047 Hz   +2.182 ppm  +/- 0.266 ppm
+      that is 7.9 ms of drift per hour against the system clock
+      via packet timestamps, 5970 packets over 60.0 s
+      cross-check: IAudioClock polling gives 7.849 +/- 14.467 ppm, a difference of 5.667 ppm
+      uncertainty: regression 0.006 ppm, batch scatter 0.266 ppm; the larger is reported
+
+  [4] Headset (iClever-BTH12)
+      capture   nominal 16000 Hz, 1 ch, 32-bit IEEE float
+      ! uncertainty 19.356 ppm exceeds the 5.0 ppm needed to be worth reporting
 
   CLOCK DOMAINS
-    endpoints whose measured rates agree within 2.000 ppm share a crystal
-    domain 1: [1] Speakers (2- Realtek ...)  +  [2] Microphone Array (2- Realtek ...)
+    endpoints whose measured rates agree within 2.000 ppm are locked to the same clock
+    domain 1: [2] Speakers (2- Realtek ...)  +  [3] Microphone Array (2- Realtek ...)
+          one physical device, so this is one crystal
 
   WILL THESE TWO DRIFT APART?
 
     pair         relative      apart per hour   verdict
-    [1] vs [2]   -0.009 ppm    0.0 ms           same clock, locked
-        at 24 fps, one frame out of sync after 53.7 days
-        at 30 fps, one frame out of sync after 43.0 days
-        at 60 fps, one frame out of sync after 21.5 days
+    [2] vs [3]   0.007 ppm     0.0 ms           same clock, locked
+        at 24 fps, one frame out of sync after 73.8 days
+        at 30 fps, one frame out of sync after 59.1 days
+        at 60 fps, one frame out of sync after 29.5 days
 ```
 
-That is a real run on the author's machine. Both endpoints sit on one Realtek
-codec, so they share a crystal and will never drift apart - which is the
-answer you want before you hit record. The `+/-` symbol is printed as a proper
-glyph in the terminal; it is written out here so it survives every viewer.
+That is a real run on the author's machine, unedited, with a Bluetooth headset
+connected - which is why it is worth showing. Four endpoints, and the tool
+reports a number for two of them.
+
+The speakers and the microphone array sit on one Realtek codec, so they share a
+crystal and will never drift apart. That is the answer you want before you hit
+record.
+
+The other two are refused, for two different reasons, and the refusals are the
+point. The Bluetooth *render* endpoint advertises 48000 Hz while its stream is
+actually running at 16000 Hz in hands-free mode - `-666665` ppm is exactly
+`16000/48000 - 1` - so the reading is not a crystal tolerance at all and the
+tool says so instead of printing it. The Bluetooth *microphone* measures fine
+but not precisely enough over 60 seconds to be worth reporting, and it says
+that too, with the threshold it missed.
+
+The `+/-` symbol is printed as a proper glyph in the terminal; it is written
+out here so it survives every viewer.
 
 ---
 
@@ -192,6 +215,37 @@ scatter of those rates gives a second, empirical error. **The larger of the two
 is reported.** This is self-calibrating: when the wander is absent the two
 agree, and when it appears the error bar grows on its own.
 
+### "Locked" and "one crystal" are two different claims
+
+Two endpoints that measure at the same rate will not drift apart. That is the
+practical answer, and it is what the pair table reports.
+
+It is not the same as sharing a crystal, and the difference shows up the moment
+a Bluetooth device is connected. The driver resamples a Bluetooth stream onto
+the host clock, so it reads as *perfectly* locked - because it has been made to
+be. Call that "one crystal" and you have described the hardware wrongly while
+being accidentally right about the sync.
+
+A measurement cannot separate those two cases: a resampled endpoint and a
+genuinely co-clocked one look identical. So the tool does not try. It reads the
+**device instance path** Windows records for each endpoint - the same hardware
+topology the verification suite uses as an independent reference - and reports
+which of the two it is:
+
+```
+  domain 1: [2] Speakers (2- Realtek ...)  +  [3] Microphone Array (2- Realtek ...)
+        one physical device, so this is one crystal
+```
+
+```
+  domain 1: [2] Speakers (2- Realtek ...)  +  [4] Headset (iClever-BTH12)
+        2 separate physical devices: locked, but by resampling, not by a shared crystal
+```
+
+If Windows will not name the hardware behind even one member of a domain, the
+tool makes neither claim and says so. One known path plus one unknown is not
+agreement.
+
 ### What it will not do
 
 The tool refuses to report a number it cannot stand behind, rather than
@@ -204,7 +258,9 @@ printing one anyway:
 - an uncertainty above 5 ppm, which cannot decide the question the tool exists
   to answer
 
-Each refusal says which one it was.
+Each refusal says which one it was. A refused endpoint is also excluded from
+the tolerance the clock-domain grouping uses, so one resampled device cannot
+widen the threshold until every endpoint on the machine looks identical.
 
 ## Read-only
 
@@ -266,7 +322,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File realcheck.ps1   # real s
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File mutate.ps1      # can the tests fail?
 ```
 
-### selftest.ps1 - 254 assertions, 0 failures
+### selftest.ps1 - 279 assertions, 0 failures
 
 Ground truth planted in synthetic series: seven different drift rates
 recovered exactly, a deliberate +/-20 ppm oscillation the batch means must
@@ -274,7 +330,7 @@ expose and the whole-series fit must hide, every refusal path, a full report
 built with **a different distinctive value in every field** so a tool that
 transposes two fields cannot pass, and a JSON round trip.
 
-### realcheck.ps1 - 97-98 assertions, 0 failures
+### realcheck.ps1 - 103-104 assertions, 0 failures
 
 The tool's COM view of the machine, checked against independent references
 written with a completely different technique.
@@ -292,6 +348,7 @@ summary line so they can never be mistaken for passes.
 | COM `IMMDeviceEnumerator` | `Get-PnpDevice -Class AudioEndpoint` |
 | `QueryPerformanceFrequency` | `[Diagnostics.Stopwatch]::Frequency` |
 | "these share a crystal" | the device instance path Windows records for each endpoint |
+| the device instance path the tool itself reads over COM | the same value hand-parsed out of the registry |
 | measured drift | drift planted *inside the real captured series* |
 | the `-SkipMeasure` code path | the measure code path, field for field |
 
@@ -308,8 +365,9 @@ Real numbers from that run:
   recovered to within 0.0001 ppm while surrounded by real samples that must
   not leak into the answer. With both endpoints usable that is **20
   recoveries across ~11,990 real timestamps**.
-- **24 static fields** compared between the enumerate and measure code paths,
-  **0 mismatches**.
+- **52 static fields** compared between the enumerate and measure code paths,
+  **0 mismatches** - including the device instance path, which is now part of
+  what the tool claims and not just part of how it is tested.
 - **971 of 972 registry values** byte-identical before and after, the one
   exclusion classified volatile by observation and printed with its decoded
   value.
@@ -349,16 +407,16 @@ reason: a field like `48000` or `{0.0.0.00000000}.{...}` contains no cased
 letters, so upper-casing it is a no-op and the control decides nothing. That
 is settled *before* looking at the outcome, never after.
 
-### mutate.ps1 - 41 of 41 mutations killed
+### mutate.ps1 - 51 of 51 mutations killed
 
 Proving the tool is right is only half of it. These suites also have to be
-capable of being *wrong*. `mutate.ps1` injects 43 specific bugs into a copy of
+capable of being *wrong*. `mutate.ps1` injects 53 specific bugs into a copy of
 the tool - inverted comparisons, wrong divisors, dropped bounds, a slope that
 divides the wrong way, an error bar that reports the smaller of two estimates -
 and requires `selftest.ps1` to fail on every one.
 
 ```
-mutation score      41 / 41
+mutation score      51 / 51
 survivors           0
 invalid controls    1 (dead anchors, counted separately)
 equivalent mutants  1 (excluded from the score, proven)
@@ -442,6 +500,29 @@ number rather than an error.
   only `DEVICE_STATE_ACTIVE` endpoints and reports the rest by name and state
   without touching them. A test that perturbs the thing it is about to
   measure is not a test.
+- **A Bluetooth render endpoint can advertise a rate it is not running at.**
+  With the headset's microphone in use, Windows reports the *render* endpoint's
+  mix format as 48000 Hz while the stream actually runs at 16000 Hz in
+  hands-free mode. The packet technique reads `-666666` ppm, which is exactly
+  `16000/48000 - 1`, and is completely correct. `IAudioClock` on the same
+  endpoint reports about 0 ppm, and is also correct - it reports the engine's
+  reconstructed position, not the radio's. Two instruments, one endpoint, a
+  67% disagreement, and no bug anywhere.
+- **One refused endpoint can silently disable the whole verdict.** The
+  clock-domain tolerance is derived from the worst disagreement between the two
+  techniques. That Bluetooth endpoint's 666,666 ppm disagreement pushed the
+  tolerance to **665,887 ppm** - at which point every endpoint on the machine
+  "shares a crystal" and the headline feature cannot fail. The function's own
+  comment warned about exactly this; the gate was simply missing. Endpoints the
+  tool refuses to report no longer get a vote in the threshold, and the
+  threshold is capped at the crystal ceiling so the verdict stays falsifiable.
+- **Measuring as locked is not the same as sharing a crystal.** A resampled
+  device is locked *because* it was resampled onto the host clock, and no
+  measurement can tell that apart from two devices genuinely sharing an
+  oscillator. Reporting "share a crystal" for a Bluetooth headset is wrong
+  about the hardware while being accidentally right about the sync. The tool
+  now reads the device instance path and says which of the two it is - and says
+  neither when Windows will not name the hardware.
 - **A registry value can move without anything writing it.** A read-only proof
   built on "nothing changed" failed, once, on a value that turned out to be
   `-69 -> -85` on a Bluetooth headset: signal strength in dBm, rewritten by the
@@ -490,7 +571,10 @@ read the report on another.
   the reliable part; the absolute figure inherits the reference's own error.
 - Bluetooth and virtual endpoints are usually resampled by software. Their
   "rate" is a driver's reconstruction, not a crystal, and the tool classifies
-  readings beyond 1000 ppm as exactly that rather than reporting them.
+  readings beyond 1000 ppm as exactly that rather than reporting them. A
+  resampled endpoint that *does* read plausibly will be reported as locked, and
+  correctly so, but the tool will only call it a shared crystal if the device
+  instance path says it is one device.
 - Endpoints that are not active cannot be measured. Plug it in and enable it
   first.
 - The render oscillation described above is real on this hardware. Whether it

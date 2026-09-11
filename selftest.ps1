@@ -447,6 +447,34 @@ t_Ok -Name 'unexplained disagreement does widen the floor' -Cond ($t_fl -gt 10.0
 $t_fl = Get-SystematicFloor -Endpoints @() -Default 2.0
 t_Near -Name 'no comparable endpoints leaves the default' -Expected 2.0 -Actual $t_fl -Tol 1e-9
 
+# A resampled endpoint - real Bluetooth hardware reads -666671 ppm on one
+# technique and near zero on the other - must not be allowed to set the
+# resolution for the real crystals. Before this was gated, one connected
+# headset pushed the clock-domain tolerance to 665887 ppm, which would call
+# every endpoint on the machine one clock domain: a verdict that cannot fail.
+$t_bt = t_FloorEp -Pkt -666671.0 -PktSe 0.5 -Clk 1.2 -ClkSe 0.5
+$t_fl = Get-SystematicFloor -Endpoints @($t_bt) -Default 2.0
+t_Near -Name 'a resampled endpoint cannot inflate the systematic floor' -Expected 2.0 -Actual $t_fl -Tol 1e-9
+# Either technique can be the one that goes wild on a resampled endpoint, so
+# each reading needs its own gate. Testing only one leaves the other unguarded
+# and, worse, untested - the mutation harness proved exactly that.
+$t_bt2 = t_FloorEp -Pkt 1.2 -PktSe 0.5 -Clk -666671.0 -ClkSe 0.5
+$t_fl = Get-SystematicFloor -Endpoints @($t_bt2) -Default 2.0
+t_Near -Name 'and neither can it when the clock technique is the wild one' -Expected 2.0 -Actual $t_fl -Tol 1e-9
+# ... and it must not drag a genuine crystal's floor up with it either.
+$t_fl = Get-SystematicFloor -Endpoints @($t_bt, (t_FloorEp -Pkt 2.5 -PktSe 0.2 -Clk 14.5 -ClkSe 0.2)) -Default 2.0
+t_Ok -Name 'a real endpoint still sets the floor when a resampled one is present' `
+     -Cond (($t_fl -gt 10.0) -and ($t_fl -lt 20.0)) -Info ('floor ' + ('{0:F3}' -f $t_fl))
+# NEGATIVE CONTROL: the gate must key on implausibility, not just on being big.
+# A large-but-plausible disagreement still has to widen the floor.
+$t_fl = Get-SystematicFloor -Endpoints @((t_FloorEp -Pkt -900.0 -PktSe 0.2 -Clk 1.0 -ClkSe 0.2)) -Default 2.0
+t_Ok -Name 'NEGATIVE CONTROL: a large but plausible disagreement is not gated out' `
+     -Cond ($t_fl -gt 800.0) -Info ('floor ' + ('{0:F3}' -f $t_fl))
+# The floor can never reach the crystal ceiling, or every endpoint matches.
+$t_fl = Get-SystematicFloor -Endpoints @((t_FloorEp -Pkt -999.0 -PktSe 0.2 -Clk 999.0 -ClkSe 0.2)) -Default 2.0
+t_Ok -Name 'the floor is capped at the crystal ceiling so the verdict can still fail' `
+     -Cond ($t_fl -le $script:MaxCrystalPpm) -Info ('floor ' + ('{0:F3}' -f $t_fl) + ' ceiling ' + [string]$script:MaxCrystalPpm)
+
 # ---------------------------------------------------------------------------
 t_Section 'fps parsing'
 # -File hands every argument over as a string, and .NET will happily read
@@ -828,6 +856,103 @@ t_Eq -Name 'the bit depth survives the skip' -Expected 24 -Actual $t_skipRep.End
 t_Eq -Name 'and no rate is invented' -Expected 0 -Actual $t_skipRep.Endpoints[0].TrueRate
 t_Eq -Name 'and no clock domain is claimed' -Expected 0 -Actual $t_skipRep.ClockDomainCount
 t_Eq -Name 'and no drift pair is offered' -Expected 0 -Actual (@($t_skipRep.Pairs)).Count
+
+# ---------------------------------------------------------------------------
+t_Section 'locked to the same clock is not the same claim as one crystal'
+# A Bluetooth headset measures as perfectly locked to the host clock, because
+# the driver resamples it onto the host clock. That is genuinely useful - they
+# will not drift apart - but it is NOT a shared crystal, and saying so would be
+# an over-claim the measurement cannot support. The device instance path is
+# what decides it, and it comes from the hardware, not from the numbers.
+function t_DomainMap { param([string]$HwA, [string]$HwB)
+    $t_dm = @{}
+    $t_dm['qpcfreq'] = '10000000'
+    $t_dm['endpoints'] = '2'
+    foreach ($t_j in 0,1) {
+        $t_dp = 'ep.' + [string]$t_j + '.'
+        $t_dm[$t_dp + 'id'] = '{0.0.' + [string]$t_j + '.00000000}.{dddddddd-0000-0000-0000-00000000000' + [string]$t_j + '}'
+        $t_dm[$t_dp + 'name'] = 'Domain ' + [string]$t_j
+        $t_dm[$t_dp + 'hw'] = $(if ($t_j -eq 0) { $HwA } else { $HwB })
+        $t_dm[$t_dp + 'flow'] = 'render'
+        $t_dm[$t_dp + 'state'] = '1'
+        $t_dm[$t_dp + 'default'] = '0'
+        $t_dm[$t_dp + 'opened'] = '1'
+        $t_dm[$t_dp + 'error'] = ''
+        $t_dm[$t_dp + 'rate'] = '48000'
+        $t_dm[$t_dp + 'channels'] = '2'
+        $t_dm[$t_dp + 'bits'] = '32'
+        $t_dm[$t_dp + 'blockalign'] = '8'
+        $t_dm[$t_dp + 'avgbytes'] = '384000'
+        $t_dm[$t_dp + 'formattag'] = '65534'
+        $t_dm[$t_dp + 'subformat'] = '3'
+        $t_dm[$t_dp + 'clockfreq'] = '384000'
+        $t_dm[$t_dp + 'packets'] = '5998'
+        $t_dm[$t_dp + 'silentpackets'] = '0'
+        $t_dm[$t_dp + 'discont'] = '0'
+        $t_dm[$t_dp + 'tserror'] = '0'
+        $t_ds = t_MakeSeries -Ppm (2.5 + (0.1 * $t_j)) -N 800 -StepSec 0.01
+        $t_dm[$t_dp + 'pkt.x'] = ($t_ds.X -join ',')
+        $t_dm[$t_dp + 'pkt.y'] = ($t_ds.Y -join ',')
+        $t_dm[$t_dp + 'clk.x'] = ''
+        $t_dm[$t_dp + 'clk.y'] = ''
+    }
+    return $t_dm
+}
+function t_RenderReport { param($Report)
+    $script:Silent = $false
+    return ((Show-AudioDriftReport -Report $Report 6>&1 | Out-String))
+}
+
+# The device instance path survives the round trip from the native emitter.
+$t_oneHw = '{1}.INTELAUDIO\FUNC_01&VEN_10EC&DEV_0274'
+$t_repSame = Get-AudioDriftReport -Map (t_DomainMap -HwA $t_oneHw -HwB $t_oneHw) -FpsList @(60.0) -RequestedSeconds 60
+t_Eq -Name 'the device instance path reaches the endpoint record' -Expected $t_oneHw -Actual (@($t_repSame.Endpoints)[0].Hw)
+t_Eq -Name 'two interfaces of one device are one domain' -Expected 1 -Actual $t_repSame.ClockDomainCount
+$t_txtSame = t_RenderReport -Report $t_repSame
+t_Ok -Name 'one physical device is reported as one crystal' -Cond ($t_txtSame -cmatch 'one physical device, so this is one crystal')
+t_Ok -Name 'and the header no longer asserts a crystal it has not established' -Cond ($t_txtSame -cmatch 'locked to the same clock')
+t_Ok -Name 'NEGATIVE CONTROL: the one-device wording is absent when it should be' `
+     -Cond (-not ($t_txtSame -cmatch 'separate physical devices'))
+
+# Same numbers, different hardware. The verdict text must change.
+$t_repSplit = Get-AudioDriftReport -Map (t_DomainMap -HwA $t_oneHw -HwB '{1}.BTHHFENUM\BTHHFPAUDIO\8&380CA4EB') -FpsList @(60.0) -RequestedSeconds 60
+t_Eq -Name 'two devices that read alike are still one measured domain' -Expected 1 -Actual $t_repSplit.ClockDomainCount
+t_Ok -Name 'and the pair is still reported as locked, because it is' -Cond (@($t_repSplit.Pairs)[0].SameClock)
+$t_txtSplit = t_RenderReport -Report $t_repSplit
+t_Ok -Name 'but two physical devices are NOT called one crystal' -Cond (-not ($t_txtSplit -cmatch 'one physical device, so this is one crystal'))
+t_Ok -Name 'and the resampling explanation is given instead' -Cond ($t_txtSplit -cmatch 'not by a shared crystal')
+t_Ok -Name 'and it says how many devices it actually saw' -Cond ($t_txtSplit -cmatch '2 separate physical devices')
+# NEGATIVE CONTROL: identical measurements, so only the hardware fact differs.
+t_Ok -Name 'NEGATIVE CONTROL: the two renders differ only because the hardware does' `
+     -Cond (-not [String]::Equals($t_txtSame, $t_txtSplit, [StringComparison]::Ordinal))
+t_Eq -Name 'NEGATIVE CONTROL: both runs measured the same number of endpoints' -Expected $t_repSame.MeasuredCount -Actual $t_repSplit.MeasuredCount
+
+# A missing device instance path must not be counted as a device of its own,
+# or an endpoint Windows declines to describe would fake a second crystal.
+$t_repBlank = Get-AudioDriftReport -Map (t_DomainMap -HwA $t_oneHw -HwB '') -FpsList @(60.0) -RequestedSeconds 60
+$t_txtBlank = t_RenderReport -Report $t_repBlank
+t_Ok -Name 'an unknown device path claims neither one crystal nor two devices' `
+     -Cond ((-not ($t_txtBlank -cmatch 'separate physical devices')) -and (-not ($t_txtBlank -cmatch 'one physical device, so this is one crystal')))
+t_Ok -Name 'and it says so out loud rather than going quiet' -Cond ($t_txtBlank -cmatch 'does not name the hardware behind all of these')
+# The device instance path is only meaningful if it is the device instance
+# path. A wrong property key would still return a plausible-looking string and
+# would still group endpoints - just wrongly - so the key itself is pinned.
+$t_srcHw = [IO.File]::ReadAllText((Join-Path $t_here 'audiodrift.ps1'))
+t_Ok -Name 'the hardware lookup asks for the device instance path property' `
+     -Cond ($t_srcHw.IndexOf('GetStringProp(d, "b3f8fa53-0004-438e-9003-51a46e139bfc", 2)', [StringComparison]::Ordinal) -ge 0)
+t_Ok -Name 'and the friendly name still asks for its own, different property' `
+     -Cond ($t_srcHw.IndexOf('GetStringProp(d, "a45c254e-df1c-4efd-8020-67d146a850e0", 14)', [StringComparison]::Ordinal) -ge 0)
+t_Ok -Name 'NEGATIVE CONTROL: those two lookups are not the same property' `
+     -Cond (-not [String]::Equals('b3f8fa53-0004-438e-9003-51a46e139bfc', 'a45c254e-df1c-4efd-8020-67d146a850e0', [StringComparison]::Ordinal))
+t_Ok -Name 'both endpoints of the emitter carry the hardware path' `
+     -Cond (([regex]::Matches($t_srcHw, [regex]::Escape('e.Hw = GetHw(d);'))).Count -eq 2)
+# Collecting it and emitting it are two different things. A field that never
+# crosses the native boundary is a field the PowerShell side silently defaults,
+# and every endpoint would then look like unnamed hardware.
+t_Ok -Name 'and the shared emitter actually emits it' `
+     -Cond ($t_srcHw.IndexOf('sb.AppendLine(p + "hw=" + e.Hw);', [StringComparison]::Ordinal) -ge 0)
+t_Ok -Name 'NEGATIVE CONTROL: the emitter anchor is an exact line, not a prefix' `
+     -Cond ($t_srcHw.IndexOf('sb.AppendLine(p + "hw=" + e.HwRenamed);', [StringComparison]::Ordinal) -lt 0)
 
 # ---------------------------------------------------------------------------
 Write-Host ''

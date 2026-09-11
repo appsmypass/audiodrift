@@ -182,6 +182,36 @@ $m_muts = @(
     @{ Id = 'enumerate-opens-a-stream'; Desc = 'the enumerate path is given a second emitter of its own'
        Edits = @(@{ Find = '    static void EmitEndpoints(StringBuilder sb, List<Endpoint> eps) {'
                     Replace = '    static void EmitEndpointsRenamed(StringBuilder sb, List<Endpoint> eps) {' }) },
+    @{ Id = 'floor-ignores-packet-plausibility'; Desc = 'a resampled endpoint may set the systematic floor via its packet reading'
+       Edits = @(@{ Find = '        if (-not (Test-PpmPlausible -Ppm $e.PacketPpm)) { continue }'
+                    Replace = '        if ($false) { continue }' }) },
+    @{ Id = 'floor-ignores-clock-plausibility'; Desc = 'a resampled endpoint may set the systematic floor via its clock reading'
+       Edits = @(@{ Find = '        if (-not (Test-PpmPlausible -Ppm $e.ClockPpm))  { continue }'
+                    Replace = '        if ($false) { continue }' }) },
+    @{ Id = 'floor-cap-removed'; Desc = 'the systematic floor is no longer capped at the crystal ceiling'
+       Edits = @(@{ Find = '    if ($worst -gt $script:MaxCrystalPpm) { $worst = $script:MaxCrystalPpm }'
+                    Replace = '    if ($worst -gt ($script:MaxCrystalPpm * 1e9)) { $worst = $script:MaxCrystalPpm }' }) },
+    @{ Id = 'floor-gate-inverted'; Desc = 'the plausibility gate keeps only the implausible endpoints'
+       Edits = @(@{ Find = '        if (-not (Test-PpmPlausible -Ppm $e.PacketPpm)) { continue }'
+                    Replace = '        if ((Test-PpmPlausible -Ppm $e.PacketPpm)) { continue }' }) },
+    @{ Id = 'hw-never-read'; Desc = 'the device instance path is never read from the hardware'
+       Edits = @(@{ Find = '        return GetStringProp(d, "b3f8fa53-0004-438e-9003-51a46e139bfc", 2);'
+                    Replace = '        return "";' }) },
+    @{ Id = 'hw-wrong-property'; Desc = 'the hardware lookup asks for the wrong property key'
+       Edits = @(@{ Find = '        return GetStringProp(d, "b3f8fa53-0004-438e-9003-51a46e139bfc", 2);'
+                    Replace = '        return GetStringProp(d, "b3f8fa53-0004-438e-9003-51a46e139bfc", 6);' }) },
+    @{ Id = 'hw-not-emitted'; Desc = 'the hardware path is collected but never emitted'
+       Edits = @(@{ Find = "            sb.AppendLine(p + `"hw=`" + e.Hw);`r`n"
+                    Replace = '' }) },
+    @{ Id = 'crystal-claimed-unconditionally'; Desc = 'every clock domain is called one crystal'
+       Edits = @(@{ Find = '            } elseif (@($paths).Count -eq 1) {'
+                    Replace = '            } elseif ($true) {' }) },
+    @{ Id = 'unknown-hardware-ignored'; Desc = 'an endpoint Windows will not name is treated as agreement'
+       Edits = @(@{ Find = '            if ($unknown -gt 0) {'
+                    Replace = '            if ($false) {' }) },
+    @{ Id = 'resampling-reported-as-crystal'; Desc = 'separate devices are described as sharing a crystal'
+       Edits = @(@{ Find = "separate physical devices: locked, but by resampling, not by a shared crystal')"
+                    Replace = "separate physical devices, so this is one crystal')" }) },
 
     # PAIRED EDIT, declared equivalent up front and proven below. Abs(NaN)
     # and Abs(Infinity) both fail the -le comparison on their own, so these
