@@ -1,0 +1,7 @@
+# audiodrift writes nothing, but test runs and saved reports land here.
+*.json
+!package.json
+_*.ps1
+_*.txt
+*.log
+drift.json
