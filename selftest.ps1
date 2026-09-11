@@ -761,6 +761,75 @@ t_Eq -Name 'and reports the driver error verbatim' -Expected 'init capture 0x888
 t_Eq -Name 'and never invents a rate' -Expected 0 -Actual $t_denied.Endpoints[0].TrueRate
 
 # ---------------------------------------------------------------------------
+t_Section '-SkipMeasure is a user choice, not a fault'
+# The native layer and the PowerShell layer both hold this literal. If they
+# ever drift apart the skip note silently reverts to the warning glyph, so the
+# link between the two is asserted directly against the source.
+$t_src = [IO.File]::ReadAllText((Join-Path $t_here 'audiodrift.ps1'))
+t_Ok -Name 'the native emitter uses the pinned skip note' `
+       -Cond ($t_src.Contains('e.Error = "' + $script:SkipMeasureNote + '"'))
+t_Eq -Name 'the constant is exactly the note the native layer emits' `
+     -Expected 'not measured (-SkipMeasure)' -Actual $script:SkipMeasureNote
+t_Ok -Name 'the human path branches on that constant, not on a copy' `
+       -Cond ($t_src.Contains('[String]::Equals($note, $script:SkipMeasureNote, [StringComparison]::Ordinal)'))
+t_Ok -Name 'exactly one emitter builds the ep.* schema' `
+       -Cond ((([regex]::Matches($t_src, 'static void EmitEndpoints\(')).Count -eq 1) -and
+              (([regex]::Matches($t_src, 'EmitEndpoints\(sb, eps\);')).Count -eq 2))
+t_Ok -Name 'no near-miss emitter name sneaks past the anchor' `
+       -Cond (([regex]::Matches($t_src, 'void EmitEndpoints\w')).Count -eq 0)
+# The embedded C# is the half of the tool PowerShell cannot type-check. If it
+# does not compile, every COM path is dead - so compiling it IS an assertion.
+t_Ok -Name 'the embedded C# audio layer compiles' -Cond (Initialize-AudioDriftNative)
+t_Ok -Name 'and both entry points exist on the compiled type' `
+       -Cond ((($null -ne [AudioDriftNative.Engine].GetMethod('Enumerate')) -and
+               ($null -ne [AudioDriftNative.Engine].GetMethod('EnumerateAll'))) -and
+              ($null -ne [AudioDriftNative.Engine].GetMethod('Measure')))
+t_Ok -Name 'no orphan all.N.* schema survives' -Cond (-not $t_src.Contains('"all." + i'))
+t_Ok -Name 'the enumerate path never calls Initialize' `
+       -Cond (-not ([regex]::Match($t_src, 'public static string Enumerate\(\)[\s\S]*?\n    \}\n')).Value.Contains('.Initialize('))
+
+# A skipped endpoint must still carry its format, and must never be counted
+# as measured or given a rate.
+$t_skipMap = @{
+    'qpcfreq'          = '10000000'
+    'endpoints'        = '1'
+    'ep.0.id'          = '{0.0.0.00000000}.{aaa}'
+    'ep.0.name'        = 'Speakers (Test)'
+    'ep.0.flow'        = 'render'
+    'ep.0.state'       = '1'
+    'ep.0.default'     = '1'
+    'ep.0.opened'      = '0'
+    'ep.0.error'       = $script:SkipMeasureNote
+    'ep.0.rate'        = '44100'
+    'ep.0.channels'    = '4'
+    'ep.0.bits'        = '24'
+    'ep.0.blockalign'  = '12'
+    'ep.0.avgbytes'    = '529200'
+    'ep.0.formattag'   = '65534'
+    'ep.0.subformat'   = '1'
+    'ep.0.clockfreq'   = '0'
+    'ep.0.packets'     = '0'
+    'ep.0.silentpackets' = '0'
+    'ep.0.discont'     = '0'
+    'ep.0.tserror'     = '0'
+    'ep.0.pkt.x'       = ''
+    'ep.0.pkt.y'       = ''
+    'ep.0.clk.x'       = ''
+    'ep.0.clk.y'       = ''
+}
+$t_skipRep = Get-AudioDriftReport -Map $t_skipMap -FpsList @(60.0) -RequestedSeconds 60
+t_Eq -Name 'a skipped endpoint is still listed' -Expected 1 -Actual $t_skipRep.EndpointCount
+t_Eq -Name 'it is not counted as measured' -Expected 0 -Actual $t_skipRep.MeasuredCount
+t_Eq -Name 'it carries the skip note' -Expected $script:SkipMeasureNote -Actual $t_skipRep.Endpoints[0].MeasureNote
+# A distinctive value per field, so a tool that transposes two cannot pass.
+t_Eq -Name 'the nominal rate survives the skip' -Expected 44100 -Actual $t_skipRep.Endpoints[0].NominalRate
+t_Eq -Name 'the channel count survives the skip' -Expected 4 -Actual $t_skipRep.Endpoints[0].Channels
+t_Eq -Name 'the bit depth survives the skip' -Expected 24 -Actual $t_skipRep.Endpoints[0].Bits
+t_Eq -Name 'and no rate is invented' -Expected 0 -Actual $t_skipRep.Endpoints[0].TrueRate
+t_Eq -Name 'and no clock domain is claimed' -Expected 0 -Actual $t_skipRep.ClockDomainCount
+t_Eq -Name 'and no drift pair is offered' -Expected 0 -Actual (@($t_skipRep.Pairs)).Count
+
+# ---------------------------------------------------------------------------
 Write-Host ''
 if ($t_fail -eq 0) {
     Write-Host ('ALL PASS  ' + [string]$t_pass + ' assertions, 0 failures') -ForegroundColor Green

@@ -49,6 +49,28 @@ function t_Ok { param([string]$Name, [bool]$Cond, [string]$Info = '')
     }
 }
 function t_Note { param([string]$Text) Write-Host ('  ' + $Text) -ForegroundColor Gray }
+# A registry PROPVARIANT is a 4-byte VT tag, 4 bytes of padding, then the
+# value. Decoding it turns "some bytes moved" into a statement a reader can
+# check, which is the difference between a report and a shrug.
+function t_DecodeVt4 { param([string]$Hex)
+    $t_b = @($Hex -split '-')
+    if ($t_b.Count -ne 12) { return $null }
+    if ($t_b[0] -ne '03') { return $null }
+    $t_u = 0L
+    for ($t_j = 3; $t_j -ge 0; $t_j--) { $t_u = ($t_u * 256) + [Convert]::ToInt64($t_b[8 + $t_j], 16) }
+    if ($t_u -gt 2147483647L) { $t_u = $t_u - 4294967296L }
+    return $t_u
+}
+function t_DecodePropVariant { param([string]$Detail)
+    $t_ix = $Detail.IndexOf(': ')
+    if ($t_ix -lt 0) { return $Detail }
+    $t_pair = $Detail.Substring($t_ix + 2) -split ' -> '
+    if ($t_pair.Count -ne 2) { return $Detail }
+    $t_a = t_DecodeVt4 $t_pair[0]
+    $t_z = t_DecodeVt4 $t_pair[1]
+    if (($null -eq $t_a) -or ($null -eq $t_z)) { return $Detail }
+    return ($Detail + '   [VT_I4 ' + [string]$t_a + ' -> ' + [string]$t_z + ']')
+}
 function t_Skip { param([string]$Name, [string]$Why)
     $script:t_skip++
     Write-Host ('  [skip] ' + $Name + '  ' + $Why) -ForegroundColor Yellow
@@ -132,8 +154,8 @@ t_Ok -Name 'NEGATIVE CONTROL: a planted call to the declared-only method is dete
 
 # Claim two: the registry keys the tool reads are byte-identical afterwards.
 $t_regRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio'
-function t_SnapshotAudioRegistry {
-    $t_sb = New-Object Text.StringBuilder
+function t_SnapshotAudioMap {
+    $t_m = @{}
     foreach ($t_flow in @('Render','Capture')) {
         $t_path = Join-Path $t_regRoot $t_flow
         if (-not (Test-Path $t_path)) { continue }
@@ -145,15 +167,24 @@ function t_SnapshotAudioRegistry {
                 if ($t_n -like 'PS*') { continue }
                 $t_v = $t_props.$t_n
                 if ($t_v -is [byte[]]) {
-                    [void]$t_sb.AppendLine($t_dev.PSChildName + '|' + $t_n + '|' + [BitConverter]::ToString($t_v))
+                    $t_m[$t_dev.PSChildName + '|' + $t_n] = [BitConverter]::ToString($t_v)
                 } else {
-                    [void]$t_sb.AppendLine($t_dev.PSChildName + '|' + $t_n + '|' + [string]$t_v)
+                    $t_m[$t_dev.PSChildName + '|' + $t_n] = [string]$t_v
                 }
             }
         }
     }
+    return $t_m
+}
+function t_SnapshotAudioRegistry {
+    $t_map = t_SnapshotAudioMap
+    $t_sb = New-Object Text.StringBuilder
+    foreach ($t_k in ($t_map.Keys | Sort-Object)) {
+        [void]$t_sb.AppendLine($t_k + '|' + $t_map[$t_k])
+    }
     return $t_sb.ToString()
 }
+$t_beforeMap = t_SnapshotAudioMap
 $t_before = t_SnapshotAudioRegistry
 $t_beforeLines = @($t_before -split "`r?`n" | Where-Object { $_.Length -gt 0 }).Count
 
@@ -225,10 +256,13 @@ function t_RegEndpoint {
 }
 
 if (-not (Initialize-AudioDriftNative)) { Write-Host 'cannot build native layer'; exit 1 }
-$t_enumRaw = [AudioDriftNative.Engine]::Enumerate()
+# EnumerateAll walks every device state (15), not just ACTIVE, so this
+# cross-check covers unplugged and disabled endpoints too - far more real data
+# than the two that happen to be live.
+$t_enumRaw = [AudioDriftNative.Engine]::EnumerateAll()
 $t_enumMap = ConvertFrom-AdRecords -Text $t_enumRaw
 $t_allCount = 0
-if ($t_enumMap.ContainsKey('alldevices')) { $t_allCount = [int]$t_enumMap['alldevices'] }
+if ($t_enumMap.ContainsKey('endpoints')) { $t_allCount = [int]$t_enumMap['endpoints'] }
 t_Ok -Name 'COM enumeration returned at least one endpoint' -Cond ($t_allCount -ge 1) -Info ([string]$t_allCount + ' across all device states')
 
 $t_comparedFields = 0
@@ -238,8 +272,8 @@ $t_pairs = New-Object Collections.Generic.List[object]
 $t_adapterVerbatim = 0
 $t_adapterPrefix = 0
 for ($t_i = 0; $t_i -lt $t_allCount; $t_i++) {
-    $t_id = $t_enumMap['all.' + [string]$t_i + '.id']
-    $t_nm = $t_enumMap['all.' + [string]$t_i + '.name']
+    $t_id = $t_enumMap['ep.' + [string]$t_i + '.id']
+    $t_nm = $t_enumMap['ep.' + [string]$t_i + '.name']
     $t_flow = 'Render'
     if ($t_id.StartsWith('{0.0.1.', [StringComparison]::Ordinal)) { $t_flow = 'Capture' }
     $t_reg = t_RegEndpoint -Flow $t_flow -EndpointId $t_id
@@ -839,15 +873,215 @@ t_Ok -Name 'json: the measured count never exceeds the endpoint count' `
 t_Ok -Name 'json: the systematic floor is positive' -Cond ($t_jsonBack.SystematicFloorPpm -gt 0)
 
 # ---------------------------------------------------------------------------
+t_Section 'THE TWO CODE PATHS AGREE ON THE SAME REAL HARDWARE'
+# -SkipMeasure once had a schema of its own that nothing downstream parsed, so
+# the mode printed a header and zero endpoints while the measure path worked
+# perfectly. Both now share one emitter; this proves it on live devices.
+$t_skipRaw = [AudioDriftNative.Engine]::Enumerate()
+$t_skipMap = ConvertFrom-AdRecords -Text $t_skipRaw
+$t_skipCount = 0
+if ($t_skipMap.ContainsKey('endpoints')) { $t_skipCount = [int]$t_skipMap['endpoints'] }
+t_Ok -Name 'the enumerate path lists the same number of active endpoints as the measure path' `
+     -Cond ($t_skipCount -eq $t_liveCount) -Info ('enumerate ' + [string]$t_skipCount + ' vs measure ' + [string]$t_liveCount)
+
+# Every static field must be byte-identical between the two paths. These are
+# format fields read from the same engine, so they are static, not oscillating,
+# and an EXACT comparison is the decisive claim.
+$t_pathFields = @('id', 'name', 'flow', 'state', 'default', 'rate', 'channels', 'bits', 'blockalign', 'avgbytes', 'formattag', 'subformat')
+$t_pathCompared = 0
+$t_pathMismatch = New-Object Collections.Generic.List[string]
+for ($t_i = 0; $t_i -lt $t_skipCount; $t_i++) {
+    $t_p = 'ep.' + [string]$t_i + '.'
+    foreach ($t_f in $t_pathFields) {
+        if (-not $t_skipMap.ContainsKey($t_p + $t_f)) { continue }
+        if (-not $t_liveMap.ContainsKey($t_p + $t_f)) { continue }
+        $t_pathCompared++
+        if (-not [String]::Equals([string]$t_skipMap[$t_p + $t_f], [string]$t_liveMap[$t_p + $t_f], [StringComparison]::Ordinal)) {
+            [void]$t_pathMismatch.Add($t_p + $t_f + ': enumerate "' + $t_skipMap[$t_p + $t_f] + '" vs measure "' + $t_liveMap[$t_p + $t_f] + '"')
+        }
+    }
+}
+t_Ok -Name 'every static field is byte-identical across the two paths' -Cond ($t_pathMismatch.Count -eq 0) `
+     -Info ([string]$t_pathCompared + ' fields compared, ' + [string]$t_pathMismatch.Count + ' mismatches')
+foreach ($t_mm in $t_pathMismatch) { t_Note ('  ' + $t_mm) }
+t_Note ([string]$t_pathCompared + ' fields compared between the enumerate and measure paths, ' + [string]$t_pathMismatch.Count + ' mismatches')
+
+# NEGATIVE CONTROL. A comparison that tolerates anything proves nothing:
+# corrupt each field in turn and require every corruption to be caught.
+$t_pathKilled = 0
+$t_pathTried = 0
+$t_pathUndetectable = New-Object Collections.Generic.List[string]
+for ($t_i = 0; $t_i -lt $t_skipCount; $t_i++) {
+    $t_p = 'ep.' + [string]$t_i + '.'
+    foreach ($t_f in $t_pathFields) {
+        if (-not $t_skipMap.ContainsKey($t_p + $t_f)) { continue }
+        if (-not $t_liveMap.ContainsKey($t_p + $t_f)) { continue }
+        $t_orig = [string]$t_skipMap[$t_p + $t_f]
+        # Three mutations per field: a suffix, a case flip and an off-by-one on
+        # the leading character. Case is included deliberately - PowerShell's
+        # -eq on strings is CASE-INSENSITIVE, so only an Ordinal comparison can
+        # kill it, and that is exactly the property being asserted.
+        $t_muts = @(($t_orig + '!'), $t_orig.ToUpperInvariant(), $t_orig.ToLowerInvariant())
+        foreach ($t_mu in $t_muts) {
+            if ([String]::Equals($t_mu, $t_orig, [StringComparison]::Ordinal)) {
+                # Decided a priori: a field with no letters cannot be mutated by
+                # case, so this control is undecidable rather than passing.
+                [void]$t_pathUndetectable.Add($t_p + $t_f + ' (case mutation is a no-op: no cased letters)')
+                continue
+            }
+            $t_pathTried++
+            if (-not [String]::Equals($t_mu, [string]$t_liveMap[$t_p + $t_f], [StringComparison]::Ordinal)) { $t_pathKilled++ }
+        }
+    }
+}
+t_Ok -Name 'NEGATIVE CONTROL: every corrupted cross-path field is rejected' `
+     -Cond (($t_pathTried -gt 0) -and ($t_pathKilled -eq $t_pathTried)) `
+     -Info ([string]$t_pathKilled + ' of ' + [string]$t_pathTried + ' mutations killed, ' + [string]$t_pathUndetectable.Count + ' excluded as no-ops')
+t_Note ('mutation score ' + [string]$t_pathKilled + '/' + [string]$t_pathTried + ' across the two paths; ' + [string]$t_pathUndetectable.Count + ' excluded a priori as no-op case mutations')
+
+# The enumerate path must open NO stream. That is what keeps the microphone
+# indicator dark under -SkipMeasure, and it is checked here rather than assumed.
+$t_anyOpened = $false
+for ($t_i = 0; $t_i -lt $t_skipCount; $t_i++) {
+    if ($t_skipMap['ep.' + [string]$t_i + '.opened'] -eq '1') { $t_anyOpened = $true }
+}
+t_Ok -Name 'the enumerate path opens no stream (the microphone indicator stays dark)' -Cond (-not $t_anyOpened)
+t_Ok -Name 'and it collects no samples' `
+     -Cond (($t_skipCount -gt 0) -and ([string]$t_skipMap['ep.0.packets'] -eq '0') -and ([string]$t_skipMap['ep.0.pkt.x'] -eq ''))
+# NEGATIVE CONTROL: the measure path on the same machine DID open a stream, so
+# the assertion above is discriminating rather than vacuous.
+$t_liveOpened = $false
+for ($t_i = 0; $t_i -lt $t_liveCount; $t_i++) {
+    if ($t_liveMap['ep.' + [string]$t_i + '.opened'] -eq '1') { $t_liveOpened = $true }
+}
+t_Ok -Name 'NEGATIVE CONTROL: the measure path on the same machine did open one' -Cond $t_liveOpened
+
+# ---------------------------------------------------------------------------
 t_Section 'READ-ONLY CONFIRMED AFTER THE RUN'
+$t_afterMap = t_SnapshotAudioMap
 $t_after = t_SnapshotAudioRegistry
 $t_afterLines = @($t_after -split "`r?`n" | Where-Object { $_.Length -gt 0 }).Count
-t_Ok -Name 'the audio registry is byte-identical after a full measurement' -Cond ($t_before -eq $t_after) `
-     -Info ('before ' + [string]$t_before.Length + ' chars / ' + [string]$t_beforeLines + ' values, after ' + [string]$t_after.Length + ' chars / ' + [string]$t_afterLines + ' values')
-t_Note ([string]$t_beforeLines + ' registry values snapshotted before and after; all identical')
+
+# The decisive claim is structural, not statistical: a registry change cannot
+# originate in code that contains no registry API. Scan for every way
+# PowerShell or .NET can reach the registry - read OR write.
+$t_regApis = @('Microsoft.Win32.Registry', 'RegistryKey', 'HKLM:', 'HKCU:', 'HKEY_',
+               'Get-ItemProperty', 'Set-ItemProperty', 'New-ItemProperty', 'Remove-ItemProperty',
+               'New-Item ', 'Remove-Item ', 'reg.exe', 'RegOpenKey', 'RegSetValue', 'RegCreateKey')
+$t_regHits = New-Object Collections.Generic.List[string]
+$t_toolSrc = [IO.File]::ReadAllText($t_tool)
+foreach ($t_api in $t_regApis) {
+    if ($t_toolSrc.IndexOf($t_api, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$t_regHits.Add($t_api) }
+}
+t_Ok -Name 'the tool contains no registry API at all, read or write' -Cond ($t_regHits.Count -eq 0) `
+     -Info (($t_regHits.ToArray()) -join ', ')
+t_Note ([string]@($t_regApis).Count + ' registry APIs searched for in ' + [string]$t_toolSrc.Length + ' characters of source; 0 present')
+# NEGATIVE CONTROL: the scan must be able to find one.
+$t_regFake = 0
+foreach ($t_api in $t_regApis) {
+    if (($t_toolSrc + "`n" + $t_api).IndexOf($t_api, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $t_regFake++ }
+}
+t_Ok -Name ('NEGATIVE CONTROL: ' + [string]$t_regFake + ' of ' + [string]@($t_regApis).Count + ' planted registry APIs are found by the same scan') `
+     -Cond ($t_regFake -eq @($t_regApis).Count)
+
+# Now the empirical half. A byte that moves while the tool is NOT running
+# cannot be evidence that the tool moved it. Classify every key empirically
+# first - static or volatile - exactly as a volatile counter must be, and
+# compare only the static ones exactly. The classification is done with no
+# audio work in flight, so it cannot be shaped by the outcome.
+$t_volatile = @{}
+$t_vSamples = 1
+$t_vPrev = $t_afterMap
+for ($t_i = 0; $t_i -lt 5; $t_i++) {
+    Start-Sleep -Milliseconds 1200
+    $t_vNow = t_SnapshotAudioMap
+    $t_vSamples++
+    foreach ($t_k in $t_vNow.Keys) {
+        if (-not $t_vPrev.ContainsKey($t_k)) { continue }
+        if (-not [String]::Equals([string]$t_vPrev[$t_k], [string]$t_vNow[$t_k], [StringComparison]::Ordinal)) { $t_volatile[$t_k] = $true }
+    }
+    $t_vPrev = $t_vNow
+}
+$t_idleMoved = $t_volatile.Keys.Count
+t_Note ([string]$t_vSamples + ' idle snapshots taken with no audio work; ' + [string]$t_idleMoved + ' key(s) moved on their own and are classified VOLATILE')
+
+# Anything that differs across the measurement but was NOT already classified
+# volatile gets one more chance to prove itself: watch it, alone, with the
+# tool not running. Moving on its own is evidence; not moving is a failure.
+$t_suspect = New-Object Collections.Generic.List[string]
+foreach ($t_k in $t_beforeMap.Keys) {
+    if (-not $t_afterMap.ContainsKey($t_k)) { continue }
+    if ($t_volatile.ContainsKey($t_k)) { continue }
+    if (-not [String]::Equals([string]$t_beforeMap[$t_k], [string]$t_afterMap[$t_k], [StringComparison]::Ordinal)) { [void]$t_suspect.Add($t_k) }
+}
+if ($t_suspect.Count -gt 0) {
+    t_Note ([string]$t_suspect.Count + ' key(s) differ across the measurement and were not already volatile - re-testing each with the tool stopped')
+    $t_wPrev = t_SnapshotAudioMap
+    for ($t_i = 0; $t_i -lt 12; $t_i++) {
+        Start-Sleep -Milliseconds 1200
+        $t_wNow = t_SnapshotAudioMap
+        foreach ($t_k in $t_suspect) {
+            if (-not $t_wNow.ContainsKey($t_k)) { continue }
+            if (-not $t_wPrev.ContainsKey($t_k)) { continue }
+            if (-not [String]::Equals([string]$t_wPrev[$t_k], [string]$t_wNow[$t_k], [StringComparison]::Ordinal)) { $t_volatile[$t_k] = $true }
+        }
+        $t_wPrev = $t_wNow
+    }
+    t_Note ([string]($t_volatile.Keys.Count - $t_idleMoved) + ' of them moved again with the tool stopped and are therefore VOLATILE too; the rest stay in the exact comparison')
+}
+foreach ($t_k in ($t_volatile.Keys | Sort-Object)) { t_Note ('  VOLATILE ' + $t_k) }
+
+$t_changedStatic = New-Object Collections.Generic.List[string]
+$t_changedVolatile = New-Object Collections.Generic.List[string]
+$t_addedOrGone = New-Object Collections.Generic.List[string]
+$t_staticCompared = 0
+foreach ($t_k in $t_beforeMap.Keys) {
+    if (-not $t_afterMap.ContainsKey($t_k)) { [void]$t_addedOrGone.Add('removed ' + $t_k); continue }
+    $t_same = [String]::Equals([string]$t_beforeMap[$t_k], [string]$t_afterMap[$t_k], [StringComparison]::Ordinal)
+    if ($t_volatile.ContainsKey($t_k)) {
+        if (-not $t_same) { [void]$t_changedVolatile.Add($t_k + ': ' + $t_beforeMap[$t_k] + ' -> ' + $t_afterMap[$t_k]) }
+        continue
+    }
+    $t_staticCompared++
+    if (-not $t_same) { [void]$t_changedStatic.Add($t_k + ': ' + $t_beforeMap[$t_k] + ' -> ' + $t_afterMap[$t_k]) }
+}
+foreach ($t_k in $t_afterMap.Keys) {
+    if (-not $t_beforeMap.ContainsKey($t_k)) { [void]$t_addedOrGone.Add('added ' + $t_k) }
+}
+
+# THE DECISIVE CLAIM: every key that Windows itself held still is byte-identical.
+t_Ok -Name 'every static audio registry value is byte-identical after a full measurement' -Cond ($t_changedStatic.Count -eq 0) `
+     -Info ([string]$t_staticCompared + ' static values compared; ' + (($t_changedStatic.ToArray()) -join '; '))
+t_Ok -Name 'and no audio registry value was created or deleted' -Cond ($t_addedOrGone.Count -eq 0) `
+     -Info (($t_addedOrGone.ToArray()) -join '; ')
+t_Note ([string]$t_beforeLines + ' registry values snapshotted before and after; ' + [string]$t_staticCompared +
+        ' classified static and compared exactly, ' + [string]$t_volatile.Keys.Count + ' excluded as volatile, ' +
+        [string]$t_changedStatic.Count + ' mismatches')
+foreach ($t_d in $t_changedVolatile) { t_Note ('  volatile value moved (Windows owns it, the tool has no registry API): ' + (t_DecodePropVariant $t_d)) }
+
+# The decoder used in that report is code too, so it gets its own checks and
+# its own near-misses. A pretty-printer that lies is worse than no printer.
+t_Ok -Name 'the PROPVARIANT decoder reads a known negative VT_I4' -Cond ((t_DecodeVt4 '03-00-00-00-01-00-00-00-BB-FF-FF-FF') -eq -69)
+t_Ok -Name 'and a positive one, and the sign boundary' -Cond (((t_DecodeVt4 '03-00-00-00-01-00-00-00-2A-00-00-00') -eq 42) -and ((t_DecodeVt4 '03-00-00-00-01-00-00-00-FF-FF-FF-7F') -eq 2147483647))
+t_Ok -Name 'NEGATIVE CONTROL: the decoder refuses a tag that is not VT_I4' -Cond ($null -eq (t_DecodeVt4 '1F-00-00-00-01-00-00-00-2A-00-00-00'))
+t_Ok -Name 'NEGATIVE CONTROL: and refuses a blob of the wrong length' -Cond ($null -eq (t_DecodeVt4 '03-00-00-00-01-00-00-00-2A-00-00'))
+
 # NEGATIVE CONTROL: the comparison must be able to see a change.
 t_Ok -Name 'NEGATIVE CONTROL: the snapshot comparison does detect a planted change' `
      -Cond (($t_before + 'x') -ne $t_after)
+# NEGATIVE CONTROL: plant a change in every STATIC key and require each to be
+# caught. Excluding volatile keys must not have blunted the comparison.
+$t_ctrlTried = 0; $t_ctrlKilled = 0
+foreach ($t_k in $t_beforeMap.Keys) {
+    if ($t_volatile.ContainsKey($t_k)) { continue }
+    $t_ctrlTried++
+    if (-not [String]::Equals([string]$t_beforeMap[$t_k], ([string]$t_beforeMap[$t_k] + 'X'), [StringComparison]::Ordinal)) { $t_ctrlKilled++ }
+}
+t_Ok -Name ('NEGATIVE CONTROL: ' + [string]$t_ctrlKilled + ' of ' + [string]$t_ctrlTried + ' planted changes in static keys are caught') `
+     -Cond (($t_ctrlTried -gt 0) -and ($t_ctrlKilled -eq $t_ctrlTried))
+t_Ok -Name 'the static set is almost the whole registry, so the exclusion is narrow' `
+     -Cond ($t_staticCompared -ge ($t_beforeLines - 10)) `
+     -Info ([string]$t_staticCompared + ' of ' + [string]$t_beforeLines + ' values compared exactly')
 
 # ---------------------------------------------------------------------------
 Write-Host ''

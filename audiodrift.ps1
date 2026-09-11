@@ -56,6 +56,11 @@ $script:DefaultFloorPpm   = 2.0
 # Above this the reading is not a crystal tolerance. Consumer crystals are
 # tens of ppm; a Bluetooth or resampled endpoint can read in the thousands.
 $script:MaxCrystalPpm     = 1000.0
+# The note the native layer attaches to every endpoint under -SkipMeasure.
+# A skip the USER asked for is not a fault, so it must not be printed with the
+# warning glyph - that is the cry-wolf trap. Pinned by selftest so the two
+# sides cannot drift apart silently.
+$script:SkipMeasureNote   = 'not measured (-SkipMeasure)'
 
 # ---------------------------------------------------------------------------
 # OUTPUT HELPERS
@@ -689,24 +694,108 @@ public static class Engine {
 
     // Enumerate only. Opens no stream, so this is the safe path for a machine
     // with no audio hardware or a caller that only wants the inventory.
-    public static string Enumerate() {
+    // One emitter for both entry points. -SkipMeasure used to have a schema of
+    // its own ("all.N.*") that nothing downstream parsed, so the mode printed a
+    // header and zero endpoints. Sharing the emitter makes that class of drift
+    // impossible: the enumerate path cannot diverge from the measure path.
+    static void EmitEndpoints(StringBuilder sb, List<Endpoint> eps) {
+        foreach (Endpoint e in eps) {
+            string p = "ep." + e.Index + ".";
+            sb.AppendLine(p + "id=" + e.Id);
+            sb.AppendLine(p + "name=" + e.Name);
+            sb.AppendLine(p + "flow=" + e.Flow);
+            sb.AppendLine(p + "state=" + e.State.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "default=" + (e.IsDefault ? "1" : "0"));
+            sb.AppendLine(p + "opened=" + (e.Opened ? "1" : "0"));
+            sb.AppendLine(p + "error=" + e.Error);
+            sb.AppendLine(p + "rate=" + e.Fmt.nSamplesPerSec.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "channels=" + e.Fmt.nChannels.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "bits=" + e.Fmt.wBitsPerSample.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "blockalign=" + e.Fmt.nBlockAlign.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "avgbytes=" + e.Fmt.nAvgBytesPerSec.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "formattag=" + e.Fmt.wFormatTag.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "subformat=" + e.SubFormat.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "clockfreq=" + e.ClockFreq.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "packets=" + e.Packets.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "silentpackets=" + e.SilentPackets.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "discont=" + e.Discont.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "tserror=" + e.TsError.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine(p + "pkt.x=" + string.Join(",", e.PktX.ConvertAll<string>(F).ToArray()));
+            sb.AppendLine(p + "pkt.y=" + string.Join(",", e.PktY.ConvertAll<string>(F).ToArray()));
+            sb.AppendLine(p + "clk.x=" + string.Join(",", e.ClkX.ConvertAll<string>(F).ToArray()));
+            sb.AppendLine(p + "clk.y=" + string.Join(",", e.ClkY.ConvertAll<string>(F).ToArray()));
+        }
+    }
+
+    // Format only: Activate hands back an IAudioClient, and GetMixFormat reads
+    // the engine format off it WITHOUT Initialize. No stream is created, so on
+    // a capture endpoint the microphone indicator never lights.
+    //
+    // stateMask is the DEVICE_STATE mask: 1 = ACTIVE (what the tool shows),
+    // 15 = every state including unplugged and disabled (what realcheck walks
+    // so it can cross-check far more endpoints than are currently live).
+    public static string Enumerate() { return EnumerateCore(1); }
+    public static string EnumerateAll() { return EnumerateCore(15); }
+
+    static string EnumerateCore(int stateMask) {
         StringBuilder sb = new StringBuilder();
         long qf; QueryPerformanceFrequency(out qf);
         sb.AppendLine("qpcfreq=" + qf.ToString(CultureInfo.InvariantCulture));
+
         IMMDeviceEnumerator en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
-        IMMDeviceCollection all;
-        int hr = en.EnumAudioEndpoints(2, 15, out all);
+        string defRender = "", defCapture = "";
+        IMMDevice dr;
+        if (en.GetDefaultAudioEndpoint(0, 0, out dr) == 0) dr.GetId(out defRender);
+        IMMDevice dc;
+        if (en.GetDefaultAudioEndpoint(1, 0, out dc) == 0) dc.GetId(out defCapture);
+
+        IMMDeviceCollection act;
+        int hr = en.EnumAudioEndpoints(2, stateMask, out act);
         if (hr != 0) { sb.AppendLine("enumerror=0x" + hr.ToString("X8")); return sb.ToString(); }
-        uint na; all.GetCount(out na);
-        sb.AppendLine("alldevices=" + na.ToString(CultureInfo.InvariantCulture));
-        for (uint i = 0; i < na; i++) {
-            IMMDevice d; all.Item(i, out d);
-            string id; d.GetId(out id);
-            int st; d.GetState(out st);
-            sb.AppendLine("all." + i + ".id=" + id);
-            sb.AppendLine("all." + i + ".name=" + GetName(d));
-            sb.AppendLine("all." + i + ".state=" + st.ToString(CultureInfo.InvariantCulture));
+        uint n; act.GetCount(out n);
+        sb.AppendLine("endpoints=" + n.ToString(CultureInfo.InvariantCulture));
+
+        List<Endpoint> eps = new List<Endpoint>();
+        for (uint i = 0; i < n; i++) {
+            IMMDevice d; act.Item(i, out d);
+            Endpoint e = new Endpoint();
+            e.Index = (int)i;
+            d.GetId(out e.Id);
+            e.Name = GetName(d);
+            d.GetState(out e.State);
+            e.Flow = e.Id.StartsWith("{0.0.1.", StringComparison.Ordinal) ? "capture" : "render";
+            e.IsDefault = (e.Id == defRender) || (e.Id == defCapture);
+            e.Opened = false;
+            e.Error = "not measured (-SkipMeasure)";
+            // Only probe ACTIVE endpoints. Activating a client on an unplugged
+            // or disabled device achieves nothing and stirs up the audio
+            // service right before a measurement - which is exactly how an
+            // endpoint intermittently failed to open in the suite that came
+            // after it. DEVICE_STATE_ACTIVE is 1.
+            IAudioClient probe = null;
+            if (e.State != 1) { e.Error = "endpoint is not active (state " + e.State.ToString(CultureInfo.InvariantCulture) + ")"; }
+            else {
+            try {
+                object o;
+                int ahr = d.Activate(ref CLI, 1, IntPtr.Zero, out o);
+                if (ahr != 0) { e.Error = "activate 0x" + ahr.ToString("X8"); }
+                else {
+                    probe = (IAudioClient)o;
+                    IntPtr pfmt;
+                    int fhr = probe.GetMixFormat(out pfmt);
+                    if (fhr != 0) { e.Error = "mixformat 0x" + fhr.ToString("X8"); }
+                    else {
+                        e.Fmt = (WAVEFORMATEX)Marshal.PtrToStructure(pfmt, typeof(WAVEFORMATEX));
+                        e.SubFormat = ReadSubFormat(pfmt, e.Fmt);
+                    }
+                }
+            } catch (Exception ex) { e.Error = ex.GetType().Name + ": " + ex.Message; }
+            }
+            if (probe != null) { try { Marshal.ReleaseComObject(probe); } catch { } }
+            eps.Add(e);
         }
+
+        EmitEndpoints(sb, eps);
         return sb.ToString();
     }
 
@@ -910,32 +999,7 @@ public static class Engine {
             } catch { }
         }
 
-        foreach (Endpoint e in eps) {
-            string p = "ep." + e.Index + ".";
-            sb.AppendLine(p + "id=" + e.Id);
-            sb.AppendLine(p + "name=" + e.Name);
-            sb.AppendLine(p + "flow=" + e.Flow);
-            sb.AppendLine(p + "state=" + e.State.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "default=" + (e.IsDefault ? "1" : "0"));
-            sb.AppendLine(p + "opened=" + (e.Opened ? "1" : "0"));
-            sb.AppendLine(p + "error=" + e.Error);
-            sb.AppendLine(p + "rate=" + e.Fmt.nSamplesPerSec.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "channels=" + e.Fmt.nChannels.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "bits=" + e.Fmt.wBitsPerSample.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "blockalign=" + e.Fmt.nBlockAlign.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "avgbytes=" + e.Fmt.nAvgBytesPerSec.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "formattag=" + e.Fmt.wFormatTag.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "subformat=" + e.SubFormat.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "clockfreq=" + e.ClockFreq.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "packets=" + e.Packets.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "silentpackets=" + e.SilentPackets.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "discont=" + e.Discont.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "tserror=" + e.TsError.ToString(CultureInfo.InvariantCulture));
-            sb.AppendLine(p + "pkt.x=" + string.Join(",", e.PktX.ConvertAll<string>(F).ToArray()));
-            sb.AppendLine(p + "pkt.y=" + string.Join(",", e.PktY.ConvertAll<string>(F).ToArray()));
-            sb.AppendLine(p + "clk.x=" + string.Join(",", e.ClkX.ConvertAll<string>(F).ToArray()));
-            sb.AppendLine(p + "clk.y=" + string.Join(",", e.ClkY.ConvertAll<string>(F).ToArray()));
-        }
+        EmitEndpoints(sb, eps);
 
         foreach (Endpoint e in eps) {
             try {
@@ -1302,7 +1366,11 @@ function Show-AudioDriftReport {
         } else {
             $note = $e.MeasureNote
             if ([string]::IsNullOrEmpty($note)) { $note = 'not measured' }
-            Write-Warn ('      ' + $g.warn + ' ' + $note)
+            if ([String]::Equals($note, $script:SkipMeasureNote, [StringComparison]::Ordinal)) {
+                Write-Line ('      ' + $note)
+            } else {
+                Write-Warn ('      ' + $g.warn + ' ' + $note)
+            }
         }
         Write-Line ''
     }

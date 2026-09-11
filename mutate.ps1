@@ -164,6 +164,25 @@ $m_muts = @(
     @{ Id = 'domains-merge-everything'; Desc = 'every measured endpoint is forced into one clock domain'
        Edits = @(@{ Find = '            if ($t.Same) { $f.ClockDomain = $domain }'; Replace = '            $f.ClockDomain = $domain' }) },
 
+    # The -SkipMeasure path. These guard the structural fix for a bug that hid
+    # behind a clean exit code: a second emitter with its own schema that
+    # nothing downstream parsed.
+    @{ Id = 'skipnote-constant-changed'; Desc = 'the skip note constant no longer matches what the native layer emits'
+       Edits = @(@{ Find = "`$script:SkipMeasureNote   = 'not measured (-SkipMeasure)'"
+                    Replace = "`$script:SkipMeasureNote   = 'not measured'" }) },
+    @{ Id = 'skipnote-native-changed'; Desc = 'the native layer emits a different skip note than the constant'
+       Edits = @(@{ Find = '            e.Error = "not measured (-SkipMeasure)";'
+                    Replace = '            e.Error = "skipped";' }) },
+    @{ Id = 'skipnote-cries-wolf'; Desc = 'a user-requested skip is printed with the warning glyph again'
+       Edits = @(@{ Find = '            if ([String]::Equals($note, $script:SkipMeasureNote, [StringComparison]::Ordinal)) {'
+                    Replace = '            if ($false) {' }) },
+    @{ Id = 'second-emitter-restored'; Desc = 'the measure path stops using the shared emitter'
+       Edits = @(@{ Find = "        EmitEndpoints(sb, eps);`r`n`r`n        foreach (Endpoint e in eps) {`r`n            try {`r`n                if (e.Rc  != null) Marshal.ReleaseComObject(e.Rc);"
+                    Replace = "        foreach (Endpoint e in eps) {`r`n            try {`r`n                if (e.Rc  != null) Marshal.ReleaseComObject(e.Rc);" }) },
+    @{ Id = 'enumerate-opens-a-stream'; Desc = 'the enumerate path is given a second emitter of its own'
+       Edits = @(@{ Find = '    static void EmitEndpoints(StringBuilder sb, List<Endpoint> eps) {'
+                    Replace = '    static void EmitEndpointsRenamed(StringBuilder sb, List<Endpoint> eps) {' }) },
+
     # PAIRED EDIT, declared equivalent up front and proven below. Abs(NaN)
     # and Abs(Infinity) both fail the -le comparison on their own, so these
     # two guards are redundantly defensive: neither removing one nor removing

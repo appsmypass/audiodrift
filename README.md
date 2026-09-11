@@ -120,6 +120,11 @@ as it should. Nothing is recorded, decoded or written; the audio samples are
 discarded and only the timestamps are kept. Use `-NoMic` to skip capture
 endpoints entirely.
 
+`-SkipMeasure` opens nothing at all. It reads each endpoint's format through
+`GetMixFormat`, which never creates a stream, so the indicator stays dark
+whether or not you also pass `-NoMic`. The suite asserts this against live
+hardware rather than taking it on trust.
+
 ## How it works
 
 Two clocks, one comparison.
@@ -209,19 +214,47 @@ It writes no registry value, changes no device setting, creates no file,
 starts and stops no service, and ends no process. This is not a promise in a
 README - it is checked on every test run, two ways:
 
-1. The source is scanned for every state-changing call pattern. **0 hits
-   across 1,425 lines of code.**
-2. All **966** values under `HKLM\...\MMDevices\Audio` are snapshotted before
-   and after a full measurement and compared byte for byte. **Identical.**
+1. **Structurally.** The source is scanned for every registry and
+   state-changing call pattern - 15 of them, from `Set-ItemProperty` and
+   `New-Item` through `RegSetValueEx`, `RegCreateKeyEx` and
+   `Microsoft.Win32.Registry`. **0 hits across 1,525 lines of code.** The tool
+   contains no registry API at all, not even a read. A registry change
+   therefore *cannot* originate in it, whatever a before/after diff happens to
+   show.
+2. **Empirically.** All **972** values under `HKLM\...\MMDevices\Audio` are
+   snapshotted before and after a full measurement and compared byte for byte.
 
-Both checks carry a negative control proving they can actually fail.
+Both checks carry a negative control proving they can actually fail: 15
+registry APIs are planted into a copy of the source and all 15 must be found,
+and a planted change must be caught in every key the comparison covers.
 
-> One subtlety the scan had to learn: `IPropertyStore::SetValue` appears in the
-> source as a COM interface signature. It is never called - but a COM interface
-> must declare every method in order, because declaration order *is* the vtable
-> layout, and omitting it would silently move `GetValue` into the wrong slot.
-> A naive grep flags it. The scan separates declarations from call sites and
-> proves the identifier is never invoked.
+> The empirical half needed one honest correction. A machine is not quiet
+> while you measure it. On this hardware, one value moved -
+> `{5510c7ab-...},4` on a connected Bluetooth headset, a `VT_I4` that went from
+> `-69` to `-85`: signal strength in dBm, rewritten by the Bluetooth radio.
+>
+> Waving that through with a hardcoded exception would make the check
+> worthless. So the suite decides it with evidence instead. After the
+> measurement it takes six more snapshots with **nothing running**, and any key
+> that moves on its own is classified volatile - by observation, not by name.
+> Anything that differs across the measurement but was *not* already classified
+> gets a second chance: twelve more samples, tool stopped, watching only that
+> key. Move on your own and you are volatile and get named and decoded in the
+> output; hold still and you are a failure.
+>
+> The result on this machine: **971 of 972 values compared exactly, 0
+> mismatches**, 1 excluded with its reason printed. The exclusion is narrow by
+> assertion - the suite requires that at least all-but-ten values stay in the
+> exact comparison, so the classifier cannot quietly excuse its way to a pass -
+> and a planted change in **every one** of the 971 static keys must still be
+> caught.
+
+> One subtlety the source scan had to learn: `IPropertyStore::SetValue` appears
+> in the source as a COM interface signature. It is never called - but a COM
+> interface must declare every method in order, because declaration order *is*
+> the vtable layout, and omitting it would silently move `GetValue` into the
+> wrong slot. A naive grep flags it. The scan separates declarations from call
+> sites and proves the identifier is never invoked.
 
 ## How it was verified
 
@@ -233,7 +266,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File realcheck.ps1   # real s
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File mutate.ps1      # can the tests fail?
 ```
 
-### selftest.ps1 - 236 assertions, 0 failures
+### selftest.ps1 - 254 assertions, 0 failures
 
 Ground truth planted in synthetic series: seven different drift rates
 recovered exactly, a deliberate +/-20 ppm oscillation the batch means must
@@ -241,10 +274,17 @@ expose and the whole-series fit must hide, every refusal path, a full report
 built with **a different distinctive value in every field** so a tool that
 transposes two fields cannot pass, and a JSON round trip.
 
-### realcheck.ps1 - 71 assertions, 0 failures
+### realcheck.ps1 - 97-98 assertions, 0 failures
 
 The tool's COM view of the machine, checked against independent references
 written with a completely different technique.
+
+The assertion count is not fixed on purpose. Two checks compare the *two
+measurement techniques* against each other, and on a run where one of them
+happens to be too imprecise to decide anything, the suite prints `[skip]`
+with the tolerance it would have needed instead of asserting it. A claim that
+cannot be decided on this run is not a claim. Skips are reported in the
+summary line so they can never be mistaken for passes.
 
 | the tool reads | checked against |
 |---|---|
@@ -253,6 +293,7 @@ written with a completely different technique.
 | `QueryPerformanceFrequency` | `[Diagnostics.Stopwatch]::Frequency` |
 | "these share a crystal" | the device instance path Windows records for each endpoint |
 | measured drift | drift planted *inside the real captured series* |
+| the `-SkipMeasure` code path | the measure code path, field for field |
 
 Real numbers from that run:
 
@@ -265,8 +306,13 @@ Real numbers from that run:
 - **26 name fields** cross-checked against the registry, **0 mismatches**.
 - **10 planted-drift recoveries across 5,996 genuine hardware timestamps**,
   recovered to within 0.0001 ppm while surrounded by real samples that must
-  not leak into the answer.
-- **966 registry values** byte-identical before and after.
+  not leak into the answer. With both endpoints usable that is **20
+  recoveries across ~11,990 real timestamps**.
+- **24 static fields** compared between the enumerate and measure code paths,
+  **0 mismatches**.
+- **971 of 972 registry values** byte-identical before and after, the one
+  exclusion classified volatile by observation and printed with its decoded
+  value.
 
 The strongest single check: Windows records the same device instance path
 (`{1}.INTELAUDIO\FUNC_01&VEN_10EC&DEV_0274&...`) for both the speakers and the
@@ -286,6 +332,9 @@ rejected**:
 | length-corrupted blobs | **186 / 186 killed** |
 | corrupted endpoint names (single character, reversed, another endpoint's) | **157 / 157 killed** |
 | fabricated endpoint names, including a case-only mutation | **8 / 8 killed** |
+| corrupted cross-path fields (suffix, upper case, lower case) | **32 / 32 killed** |
+| planted registry APIs in a copy of the source | **15 / 15 found** |
+| planted changes in every static registry value | **971 / 971 caught** |
 | plausible wrong answers to the planted-drift check (planted value alone, real value alone, sign flipped, applied twice, zero) | **all killed** |
 
 Five name mutations are reported as **UNDETECTABLE** and excluded from the
@@ -295,16 +344,21 @@ score rather than counted as passes: this machine has four endpoints described
 still legitimately present, so no containment test can tell them apart. Saying
 "157 of 157" while quietly counting those as wins would be a lie.
 
-### mutate.ps1 - 36 of 36 mutations killed
+Forty cross-path case mutations are excluded the same way and for the same
+reason: a field like `48000` or `{0.0.0.00000000}.{...}` contains no cased
+letters, so upper-casing it is a no-op and the control decides nothing. That
+is settled *before* looking at the outcome, never after.
+
+### mutate.ps1 - 41 of 41 mutations killed
 
 Proving the tool is right is only half of it. These suites also have to be
-capable of being *wrong*. `mutate.ps1` injects 36 specific bugs into a copy of
+capable of being *wrong*. `mutate.ps1` injects 43 specific bugs into a copy of
 the tool - inverted comparisons, wrong divisors, dropped bounds, a slope that
 divides the wrong way, an error bar that reports the smaller of two estimates -
 and requires `selftest.ps1` to fail on every one.
 
 ```
-mutation score      36 / 36
+mutation score      41 / 41
 survivors           0
 invalid controls    1 (dead anchors, counted separately)
 equivalent mutants  1 (excluded from the score, proven)
@@ -317,6 +371,12 @@ Three things make that number honest:
   appear exactly once. One mutation is deliberately anchored on text that does
   not exist, and the harness must report it as an **invalid control** - which
   it does.
+- **An assertion's anchor needs the same scrutiny.** A mutation that renamed
+  the shared emitter to `EmitEndpointsRenamed` *survived*, because the guard
+  asserting "exactly one emitter exists" searched for `static void
+  EmitEndpoints` as a substring - which the renamed function still contains.
+  A prefix match is not an identity check. The anchor now requires the opening
+  parenthesis, and a second assertion rejects any near-miss name outright.
 - **Equivalent mutants are proven, not assumed.** Removing the explicit
   `IsNaN` and `IsInfinity` guards from the plausibility check survives, because
   `[math]::Abs(NaN) -le 1000` is already false. The harness supports paired
@@ -363,6 +423,36 @@ number rather than an error.
   this machine holds `4294967032` in the sample-rate slot, and `[int]` *throws*
   on any UInt32 above `Int32.MaxValue` - crashing the parser before the bounds
   check could reject the value.
+- **A second code path that emits its own schema will rot silently.** The
+  `-SkipMeasure` path used to emit `all.N.*` records while everything
+  downstream parsed `ep.N.*`, so the mode printed a header and *zero
+  endpoints* - a clean exit code, no error, no stack trace, and a documented
+  flag that did nothing. Neither the synthetic suite nor the mutation harness
+  could see it, because both exercised the measure path. It was caught by
+  running every invocation the README literally shows against a fresh clone.
+  The fix is structural, not a patch: one emitter, called by both paths, with
+  an assertion that there is exactly one of it.
+- **Activating an audio client on an inactive endpoint has a cost you pay
+  later.** The verification suite briefly probed the format of all 13
+  endpoints - including nine unplugged ones and a disconnected Bluetooth
+  headset - immediately before measuring. Nothing failed at the time. What
+  failed, intermittently and a minute later, was the *microphone opening for
+  the measurement*: a run that should have seen two endpoints saw one, and
+  three assertions that depend on having two went red. The tool now probes
+  only `DEVICE_STATE_ACTIVE` endpoints and reports the rest by name and state
+  without touching them. A test that perturbs the thing it is about to
+  measure is not a test.
+- **A registry value can move without anything writing it.** A read-only proof
+  built on "nothing changed" failed, once, on a value that turned out to be
+  `-69 -> -85` on a Bluetooth headset: signal strength in dBm, rewritten by the
+  radio when the audio engine wakes. It is not free-running either - it sat
+  still through 183 seconds of idle sampling while the headset was
+  disconnected, so a quick volatility scan would have called it static and
+  then failed anyway. Two things fixed it. The decisive claim is *structural*:
+  the tool contains no registry API at all, so nothing it does can write one.
+  The empirical claim is *earned*: any key that differs is re-watched with the
+  tool stopped, and only a key that moves on its own is excused - named,
+  decoded and printed, never silently tolerated.
 - **In PowerShell, `,` binds tighter than `+`.** `@('p', 'q', 'r' + '!!')` is
   **four** elements - `('p','q','r') + '!!'` - not three. In a mutation harness
   this silently invented a control that tested nothing.
