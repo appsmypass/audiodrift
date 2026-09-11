@@ -61,6 +61,10 @@ $script:MaxCrystalPpm     = 1000.0
 # warning glyph - that is the cry-wolf trap. Pinned by selftest so the two
 # sides cannot drift apart silently.
 $script:SkipMeasureNote   = 'not measured (-SkipMeasure)'
+# Set by Write-Bad, which is the only way a hard failure is reported. A caller
+# that redirects stdout must be able to tell an empty report from a working
+# one, so the process exit code is driven by this and nothing else.
+$script:ExitCode          = 0
 
 # ---------------------------------------------------------------------------
 # OUTPUT HELPERS
@@ -80,7 +84,16 @@ function Write-Warn { param([string]$Text)
     if (-not $script:Silent) { Write-Host $Text -ForegroundColor Yellow }
 }
 function Write-Bad { param([string]$Text)
-    if (-not $script:Silent) { Write-Host $Text -ForegroundColor Red }
+    # A hard failure. Two things must happen and neither may be forgotten by a
+    # future call site, so both live here rather than at the call sites:
+    #   1. the text is ALWAYS visible - under -Json or -Quiet stdout has to stay
+    #      machine-readable, so it goes to stderr instead of being swallowed;
+    #   2. the process exit code stops being 0.
+    # Before this existed, -Json on a machine where the audio layer failed to
+    # build printed nothing at all and still exited 0.
+    $script:ExitCode = 1
+    if ($script:Silent) { [Console]::Error.WriteLine($Text) }
+    else { Write-Host $Text -ForegroundColor Red }
 }
 function Write-Err { param([string]$Text)
     [Console]::Error.WriteLine($Text)
@@ -1518,17 +1531,20 @@ function Invoke-Main {
     }
 
     if ($FromJson.Length -gt 0) {
+        # No un-silencing on the error paths. Write-Bad already guarantees the
+        # text is visible, and forcing Silent off here would push the message
+        # onto stdout - straight into the file a -Json caller is redirecting.
         if (-not (Test-Path -LiteralPath $FromJson)) {
-            $script:Silent = $false
             Write-Bad ('audiodrift: file not found: ' + $FromJson)
             return
         }
         $txt = ''
         try { $txt = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FromJson).ProviderPath) }
-        catch { $script:Silent = $false; Write-Bad ('audiodrift: cannot read ' + $FromJson); return }
+        catch { Write-Bad ('audiodrift: cannot read ' + $FromJson); return }
         $obj = $null
         try { $obj = ConvertFrom-Json -InputObject $txt }
-        catch { $script:Silent = $false; Write-Bad ('audiodrift: not valid JSON: ' + $FromJson); return }
+        catch { Write-Bad ('audiodrift: not valid JSON: ' + $FromJson); return }
+        # Re-rendering a saved report IS the output, so this path does speak.
         $script:Silent = $false
         Show-AudioDriftReport -Report $obj
         return
@@ -1579,3 +1595,6 @@ function Invoke-Main {
 }
 
 Invoke-Main
+# Only exits when something actually failed, so dot-sourcing with -NoRun (what
+# the test suites do) still returns control to the host.
+if ($script:ExitCode -ne 0) { exit $script:ExitCode }

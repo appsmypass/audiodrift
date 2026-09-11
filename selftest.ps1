@@ -954,6 +954,86 @@ t_Ok -Name 'and the shared emitter actually emits it' `
 t_Ok -Name 'NEGATIVE CONTROL: the emitter anchor is an exact line, not a prefix' `
      -Cond ($t_srcHw.IndexOf('sb.AppendLine(p + "hw=" + e.HwRenamed);', [StringComparison]::Ordinal) -lt 0)
 
+t_Section 'a hard failure must not look like success'
+# Found by running a deliberately broken copy: with the audio layer failing to
+# compile, -Json wrote nothing to stdout and exited 0. A caller doing
+# "audiodrift -Json > drift.json" got an empty file and a success code, with no
+# way to tell that from a machine that genuinely has no endpoints. Both halves
+# of the fix live in Write-Bad so a future failure path cannot forget either.
+$t_exitSave   = $script:ExitCode
+$t_silentSave = $script:Silent
+
+$script:ExitCode = 0
+$script:Silent   = $false
+$t_badLoud = (Write-Bad 'audiodrift: t_probe loud' 6>&1 | Out-String)
+t_Ok -Name 'a failure in visible mode is printed' -Cond ($t_badLoud -cmatch 't_probe loud')
+t_Eq -Name 'and it sets the exit code' -Expected 1 -Actual $script:ExitCode
+
+# -Json and -Quiet set Silent, and stdout has to stay machine-readable, so the
+# text must move to stderr rather than disappear.
+$script:ExitCode = 0
+$script:Silent   = $true
+$t_errSave = [Console]::Error
+$t_sw = New-Object IO.StringWriter
+[Console]::SetError($t_sw)
+$t_badQuiet = (Write-Bad 'audiodrift: t_probe quiet' 6>&1 | Out-String)
+[Console]::SetError($t_errSave)
+t_Ok -Name 'a failure in silent mode is not swallowed, it goes to stderr' -Cond ($t_sw.ToString() -cmatch 't_probe quiet')
+t_Ok -Name 'and it stays off stdout so -Json output is still parseable' -Cond (-not ($t_badQuiet -cmatch 't_probe quiet'))
+t_Eq -Name 'and it sets the exit code in silent mode too' -Expected 1 -Actual $script:ExitCode
+
+# NEGATIVE CONTROL: a warning is not a failure. If every writer raised the exit
+# code, one unusable endpoint would make a working machine report total failure.
+$script:ExitCode = 0
+$script:Silent   = $false
+$t_noise  = (Write-Warn 'audiodrift: t_probe warn' 6>&1 | Out-String)
+$t_noise += (Write-Line 'audiodrift: t_probe line' 6>&1 | Out-String)
+$t_noise += (Write-Good 'audiodrift: t_probe good' 6>&1 | Out-String)
+$t_noise += (Write-Head 'audiodrift: t_probe head' 6>&1 | Out-String)
+t_Eq -Name 'NEGATIVE CONTROL: warnings and normal output leave the exit code at 0' -Expected 0 -Actual $script:ExitCode
+t_Ok -Name 'NEGATIVE CONTROL: those writers did run, so the control is not vacuous' -Cond ($t_noise -cmatch 't_probe warn')
+
+$script:ExitCode = $t_exitSave
+$script:Silent   = $t_silentSave
+
+# Structural. "Did anything fail" is only answerable if exactly one place
+# raises the code and exactly one place acts on it.
+t_Eq -Name 'the exit code is assigned in exactly two places: its initialiser and Write-Bad' `
+     -Expected 2 -Actual ([regex]::Matches($t_srcHw, '\$script:ExitCode\s+=\s+[01]\b')).Count
+t_Eq -Name 'and the script exits with that code in exactly one place' `
+     -Expected 1 -Actual ([regex]::Matches($t_srcHw, [regex]::Escape('exit $script:ExitCode'))).Count
+t_Eq -Name 'NEGATIVE CONTROL: no literal exit code is hardcoded anywhere else' `
+     -Expected 0 -Actual ([regex]::Matches($t_srcHw, '(?<![\w-])exit\s+\d')).Count
+t_Ok -Name 'which is guarded, so a clean run still exits 0' `
+     -Cond ($t_srcHw.IndexOf('if ($script:ExitCode -ne 0) { exit $script:ExitCode }', [StringComparison]::Ordinal) -ge 0)
+# The raiser has to live inside Write-Bad; sitting anywhere else would leave
+# some Write-Bad call sites silent about failing.
+$t_iBad  = $t_srcHw.IndexOf('function Write-Bad', [StringComparison]::Ordinal)
+$t_iRaise = $t_srcHw.IndexOf('$script:ExitCode = 1', [StringComparison]::Ordinal)
+$t_iErrFn = $t_srcHw.IndexOf('function Write-Err', [StringComparison]::Ordinal)
+t_Ok -Name 'and the raiser sits inside Write-Bad, not at some call site' `
+     -Cond (($t_iBad -ge 0) -and ($t_iRaise -gt $t_iBad) -and ($t_iRaise -lt $t_iErrFn))
+
+# Found by running the real tool, not by reading it: the -FromJson error paths
+# each forced Silent off before calling Write-Bad, which pushed the message onto
+# stdout - into the file a "-Json > drift.json" caller is redirecting. Write-Bad
+# already guarantees visibility, so no error path may un-silence.
+$t_badSites = @([regex]::Matches($t_srcHw, '(?<!function )Write-Bad \('))
+t_Eq -Name 'every hard-failure message still goes through Write-Bad' -Expected 5 -Actual $t_badSites.Count
+$t_unsilenced = New-Object Collections.Generic.List[string]
+foreach ($t_bs in $t_badSites) {
+    $t_from = [Math]::Max(0, $t_bs.Index - 160)
+    $t_lead = $t_srcHw.Substring($t_from, $t_bs.Index - $t_from)
+    if ($t_lead -cmatch '\$script:Silent\s*=\s*\$false') { [void]$t_unsilenced.Add($t_srcHw.Substring($t_bs.Index, 40)) }
+}
+t_Eq -Name 'and no error path un-silences itself first, which would corrupt -Json stdout' `
+     -Expected 0 -Actual $t_unsilenced.Count
+foreach ($t_us in $t_unsilenced) { t_Ok -Name ('  offending site: ' + $t_us) -Cond $false }
+# NEGATIVE CONTROL: the scan does find the pattern when it is genuinely there,
+# so a count of zero means absent rather than unsearchable.
+t_Ok -Name 'NEGATIVE CONTROL: the un-silence pattern is findable in the source at all' `
+     -Cond (([regex]::Matches($t_srcHw, '\$script:Silent\s*=\s*\$false')).Count -ge 2)
+
 # ---------------------------------------------------------------------------
 Write-Host ''
 if ($t_fail -eq 0) {

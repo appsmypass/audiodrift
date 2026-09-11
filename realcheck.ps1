@@ -1058,6 +1058,55 @@ for ($t_i = 0; $t_i -lt $t_liveCount; $t_i++) {
 t_Ok -Name 'NEGATIVE CONTROL: the measure path on the same machine did open one' -Cond $t_liveOpened
 
 # ---------------------------------------------------------------------------
+t_Section 'A REAL FAILURE IS VISIBLE TO A REAL CALLER'
+# selftest proves Write-Bad in isolation, inside one process. That is not the
+# same promise. What a user actually depends on is what crosses the process
+# boundary: "audiodrift -Json > drift.json" must not leave an empty file and a
+# success code behind. Each case below is a separate real process.
+$t_toolPath = Join-Path $t_here 'audiodrift.ps1'
+function t_RunTool { param([string]$Label, [string[]]$Argv)
+    $t_pi = New-Object Diagnostics.ProcessStartInfo
+    $t_pi.FileName = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+    # Never name a parameter $Args here - it is a PowerShell automatic variable
+    # and splatting through it silently mangles every invocation.
+    $t_pi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $t_toolPath + '" ' + ($Argv -join ' ')
+    $t_pi.UseShellExecute = $false
+    $t_pi.RedirectStandardOutput = $true
+    $t_pi.RedirectStandardError = $true
+    $t_pr = [Diagnostics.Process]::Start($t_pi)
+    $t_so = $t_pr.StandardOutput.ReadToEnd()
+    $t_se = $t_pr.StandardError.ReadToEnd()
+    $t_pr.WaitForExit()
+    return @{ Code = $t_pr.ExitCode; Out = $t_so; Err = $t_se; Label = $Label }
+}
+
+$t_okRun = t_RunTool -Label 'healthy' -Argv @('-SkipMeasure')
+t_Ok -Name 'a healthy run exits 0' -Cond ($t_okRun.Code -eq 0) -Info ('exit ' + [string]$t_okRun.Code)
+t_Ok -Name 'and it actually produced a report, so the control is not vacuous' -Cond ($t_okRun.Out.Length -gt 100)
+
+$t_missRun = t_RunTool -Label 'missing file' -Argv @('-FromJson', 'C:\audiodrift_no_such_file_98317.json')
+t_Ok -Name 'a missing -FromJson file exits non-zero' -Cond ($t_missRun.Code -ne 0) -Info ('exit ' + [string]$t_missRun.Code)
+
+# The one that was actually broken: silent modes had no stdout to carry the
+# error, so the failure vanished completely.
+$t_badJson = Join-Path $env:TEMP ('ad_badjson_' + [Guid]::NewGuid().ToString('N') + '.json')
+[IO.File]::WriteAllText($t_badJson, 'this is not json {{{', (New-Object Text.UTF8Encoding($false)))
+foreach ($t_mode in @(@(), @('-Json'), @('-Quiet'))) {
+    $t_lbl = 'visible mode'
+    if ($t_mode.Count -gt 0) { $t_lbl = $t_mode[0] + ' mode' }
+    $t_r = t_RunTool -Label $t_lbl -Argv (@('-FromJson', ('"' + $t_badJson + '"')) + $t_mode)
+    t_Ok -Name ('malformed JSON in ' + $t_lbl + ' exits non-zero') -Cond ($t_r.Code -ne 0) -Info ('exit ' + [string]$t_r.Code)
+    t_Ok -Name ('and in ' + $t_lbl + ' the reason is still visible somewhere') `
+         -Cond ((($t_r.Out + $t_r.Err) -cmatch 'not valid JSON'))
+    if ($t_mode.Count -gt 0) {
+        # stdout has to stay machine-readable: a caller redirecting it must get
+        # nothing rather than a half-report it will try to parse.
+        t_Ok -Name ('and in ' + $t_lbl + ' stdout carries no error text') -Cond (-not ($t_r.Out -cmatch 'not valid JSON'))
+    }
+}
+Remove-Item -LiteralPath $t_badJson -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
 t_Section 'READ-ONLY CONFIRMED AFTER THE RUN'
 $t_afterMap = t_SnapshotAudioMap
 $t_after = t_SnapshotAudioRegistry

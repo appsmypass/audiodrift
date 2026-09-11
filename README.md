@@ -148,6 +148,31 @@ endpoints entirely.
 whether or not you also pass `-NoMic`. The suite asserts this against live
 hardware rather than taking it on trust.
 
+### Exit codes and scripting
+
+```
+0   the report was produced
+1   nothing usable was produced, and the reason was printed
+```
+
+If you are redirecting stdout you need this, because the interesting failure
+is the silent one:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File audiodrift.ps1 -Json > drift.json
+if ($LASTEXITCODE -ne 0) { throw 'audiodrift failed' }
+```
+
+Under `-Json` and `-Quiet`, stdout carries **only** the report. Failures go to
+stderr instead, so a half-written error string can never end up inside the file
+you are about to parse. In normal mode the error is printed where you are
+looking, on stdout, in red.
+
+This is worth stating explicitly because the first version got it wrong in both
+directions: a machine where the audio layer failed to compile printed *nothing
+at all* under `-Json` and still exited `0`, and the `-FromJson` error paths
+forced their message onto stdout, straight into the redirected file.
+
 ## How it works
 
 Two clocks, one comparison.
@@ -322,7 +347,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File realcheck.ps1   # real s
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File mutate.ps1      # can the tests fail?
 ```
 
-### selftest.ps1 - 279 assertions, 0 failures
+### selftest.ps1 - 294 assertions, 0 failures
 
 Ground truth planted in synthetic series: seven different drift rates
 recovered exactly, a deliberate +/-20 ppm oscillation the batch means must
@@ -330,7 +355,7 @@ expose and the whole-series fit must hide, every refusal path, a full report
 built with **a different distinctive value in every field** so a tool that
 transposes two fields cannot pass, and a JSON round trip.
 
-### realcheck.ps1 - 103-104 assertions, 0 failures
+### realcheck.ps1 - 115 assertions, 0 failures, 0 skipped
 
 The tool's COM view of the machine, checked against independent references
 written with a completely different technique.
@@ -340,7 +365,8 @@ measurement techniques* against each other, and on a run where one of them
 happens to be too imprecise to decide anything, the suite prints `[skip]`
 with the tolerance it would have needed instead of asserting it. A claim that
 cannot be decided on this run is not a claim. Skips are reported in the
-summary line so they can never be mistaken for passes.
+summary line so they can never be mistaken for passes. The run above happened
+to skip nothing; a run that skips one or two is equally healthy.
 
 | the tool reads | checked against |
 |---|---|
@@ -351,6 +377,7 @@ summary line so they can never be mistaken for passes.
 | the device instance path the tool itself reads over COM | the same value hand-parsed out of the registry |
 | measured drift | drift planted *inside the real captured series* |
 | the `-SkipMeasure` code path | the measure code path, field for field |
+| "the report was produced" | the process exit code and the two output streams of a real launched process |
 
 Real numbers from that run:
 
@@ -370,7 +397,12 @@ Real numbers from that run:
   what the tool claims and not just part of how it is tested.
 - **971 of 972 registry values** byte-identical before and after, the one
   exclusion classified volatile by observation and printed with its decoded
-  value.
+  value. On a run where the Bluetooth radio stays quiet all **972** compare
+  exactly, which is what the run above did.
+- **5 real launched processes** for the failure contract: a healthy run, a
+  missing input file, and a malformed input file in each of the three output
+  modes. Each one's exit code and *both* streams are checked separately, so an
+  error appearing on the wrong stream fails even when the text is correct.
 
 The strongest single check: Windows records the same device instance path
 (`{1}.INTELAUDIO\FUNC_01&VEN_10EC&DEV_0274&...`) for both the speakers and the
@@ -407,16 +439,16 @@ reason: a field like `48000` or `{0.0.0.00000000}.{...}` contains no cased
 letters, so upper-casing it is a no-op and the control decides nothing. That
 is settled *before* looking at the outcome, never after.
 
-### mutate.ps1 - 51 of 51 mutations killed
+### mutate.ps1 - 57 of 57 mutations killed
 
 Proving the tool is right is only half of it. These suites also have to be
-capable of being *wrong*. `mutate.ps1` injects 53 specific bugs into a copy of
+capable of being *wrong*. `mutate.ps1` injects 59 specific bugs into a copy of
 the tool - inverted comparisons, wrong divisors, dropped bounds, a slope that
 divides the wrong way, an error bar that reports the smaller of two estimates -
 and requires `selftest.ps1` to fail on every one.
 
 ```
-mutation score      51 / 51
+mutation score      57 / 57
 survivors           0
 invalid controls    1 (dead anchors, counted separately)
 equivalent mutants  1 (excluded from the score, proven)
@@ -447,6 +479,13 @@ Three things make that number honest:
   all survived. Nine assertions were added pinning the partition exactly
   (101 samples across 4 windows must be 25/25/25/26) and the batch-means
   standard error against arithmetic done by hand. All four now die.
+- **Failing quietly is a mutation too.** Six of these attack the failure
+  contract rather than the arithmetic: an error that does not raise the exit
+  code, an exit code that is raised but never acted on, an error swallowed
+  entirely under `-Json`, an error written onto stdout where it corrupts the
+  JSON, an error path that un-silences itself, and - the other direction - an
+  ordinary warning that escalates into a total failure. A tool that cannot be
+  trusted to *report* failure is not verified by tests of its successes.
 
 ## Things this cost real time to learn
 
@@ -534,6 +573,25 @@ number rather than an error.
   The empirical claim is *earned*: any key that differs is re-watched with the
   tool stopped, and only a key that moves on its own is excused - named,
   decoded and printed, never silently tolerated.
+- **A hard failure that still exits `0` is invisible to the only caller who
+  matters.** Every error path printed a clear message and then returned
+  normally, so `audiodrift -Json > drift.json` left an empty file and a success
+  code behind. Worse, in `-Json` and `-Quiet` mode the message was routed
+  through the same "stay quiet so stdout is parseable" switch as normal output,
+  so a machine where the audio layer failed to compile printed **nothing at
+  all** and exited `0`. Both halves now live inside `Write-Bad` - it raises the
+  exit code and it picks stdout or stderr - because a fix that relies on five
+  call sites remembering two things is not a fix.
+- **Then the opposite bug, found by the same test.** Having made `Write-Bad`
+  safe, the `-FromJson` error paths were still forcing `Silent = $false` first -
+  a leftover from when un-silencing was the only way to be heard - which pushed
+  the error text onto stdout and into the redirected JSON file. The assertion
+  that caught it is structural: no error path may un-silence itself, checked by
+  scanning the source around every `Write-Bad` call site.
+- **A unit test of an output helper is not a test of the output contract.** The
+  isolated checks on `Write-Bad` passed the whole time. What found both bugs was
+  launching the real script as a real process, with a real redirect, and looking
+  at the exit code and the two streams separately.
 - **In PowerShell, `,` binds tighter than `+`.** `@('p', 'q', 'r' + '!!')` is
   **four** elements - `('p','q','r') + '!!'` - not three. In a mutation harness
   this silently invented a control that tested nothing.
@@ -554,7 +612,11 @@ number rather than an error.
 
 ## Output
 
-`-Json` emits a single object and nothing else, including on error paths.
+`-Json` emits a single object on stdout and nothing else. On an error path it
+emits nothing at all on stdout, writes the reason to stderr, and exits `1`, so
+a redirected file is either a complete report or empty - never a report with an
+error message glued to it.
+
 Per endpoint: `NominalRate`, `TrueRate`, `Ppm`, `SePpm`, `SeOlsPpm`,
 `SeEmpiricalPpm`, `Method`, `Samples`, `SpanSec`, `WindowPpms`, `MsPerHour`,
 `ClockDomain`, plus both techniques' individual results and every gate's

@@ -213,6 +213,27 @@ $m_muts = @(
        Edits = @(@{ Find = "separate physical devices: locked, but by resampling, not by a shared crystal')"
                     Replace = "separate physical devices, so this is one crystal')" }) },
 
+    # A hard failure that still exits 0 is the one bug a caller cannot see.
+    @{ Id = 'failure-does-not-set-exit-code'; Desc = 'a hard failure is reported but the exit code stays 0'
+       Edits = @(@{ Find = '    $script:ExitCode = 1'; Replace = '    $script:ExitCode = 0' }) },
+    @{ Id = 'exit-code-never-acted-on'; Desc = 'the exit code is raised but the process still exits 0'
+       Edits = @(@{ Find = 'if ($script:ExitCode -ne 0) { exit $script:ExitCode }'
+                    Replace = 'if ($false) { exit $script:ExitCode }' }) },
+    @{ Id = 'silent-mode-swallows-the-failure'; Desc = 'under -Json or -Quiet the error text disappears entirely'
+       Edits = @(@{ Find = '    if ($script:Silent) { [Console]::Error.WriteLine($Text) }'
+                    Replace = '    if ($script:Silent) { }' }) },
+    @{ Id = 'failure-text-pollutes-stdout'; Desc = 'the error is written to stdout, corrupting -Json output'
+       Edits = @(@{ Find = '    if ($script:Silent) { [Console]::Error.WriteLine($Text) }'
+                    Replace = '    if ($script:Silent) { Write-Host $Text }' }) },
+    @{ Id = 'every-warning-becomes-a-failure'; Desc = 'a plain warning raises the exit code too'
+       Edits = @(@{ Find = 'function Write-Warn { param([string]$Text)'
+                    Replace = 'function Write-Warn { param([string]$Text)
+    $script:ExitCode = 1' }) },
+    @{ Id = 'error-path-unsilences-onto-stdout'; Desc = 'an error path forces Silent off, putting its message into -Json stdout'
+       Edits = @(@{ Find = "            Write-Bad ('audiodrift: file not found: ' + `$FromJson)"
+                    Replace = "            `$script:Silent = `$false
+            Write-Bad ('audiodrift: file not found: ' + `$FromJson)" }) },
+
     # PAIRED EDIT, declared equivalent up front and proven below. Abs(NaN)
     # and Abs(Infinity) both fail the -le comparison on their own, so these
     # two guards are redundantly defensive: neither removing one nor removing
